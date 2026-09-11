@@ -1,0 +1,75 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.class
+*.pyo
+*.pyd
+.Python
+pip-log.txt
+
+# ── Virtual environments ───────────────────────────────────────────────────────
+.env
+.venv
+env/
+venv/
+ENV/
+
+# ── Distribution / packaging ───────────────────────────────────────────────────
+dist/
+build/
+*.egg-info/
+*.egg
+*.whl
+
+# ── ML / AI — Model weights (too large for GitHub, download separately) ────────
+*.pt
+*.pt/
+*.pth
+*.onnx
+*.tflite
+*.pb
+*.h5
+*.pkl
+*.bin
+*.safetensors
+yolo11n-pose/
+vehicle_classifier.pt/
+
+# ── Test / Demo videos & large media ──────────────────────────────────────────
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+
+# ── Jupyter Notebook outputs ───────────────────────────────────────────────────
+.ipynb_checkpoints/
+
+# ── OS / system files ─────────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+desktop.ini
+
+# ── IDE / editor configs ──────────────────────────────────────────────────────
+.vscode/settings.json
+.vscode/launch.json
+.idea/
+
+# ── Secrets & environment variables ──────────────────────────────────────────
+*.env
+secrets.py
+config_local.py
+
+# ── Logs & temp ───────────────────────────────────────────────────────────────
+*.log
+*.tmp
+*.bak
+logs/
+
+# ── PaddleOCR / EasyOCR / Ultralytics cache ────────────────────────────────────
+inference/
+.paddleocr/
+.EasyOCR/
+runs/

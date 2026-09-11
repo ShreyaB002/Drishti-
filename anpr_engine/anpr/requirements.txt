@@ -1,0 +1,16 @@
+# Core
+numpy>=1.24
+opencv-python-headless>=4.8
+
+# Plate detection
+ultralytics>=8.1
+
+# OCR (choose one; paddleocr is the default in config.py)
+paddleocr>=2.7
+paddlepaddle>=2.5      # CPU build; use paddlepaddle-gpu for GPU inference
+
+# Alternative OCR backend (optional, only if ocr_engine="easyocr")
+# easyocr>=1.7
+
+# Testing
+pytest>=7.4
