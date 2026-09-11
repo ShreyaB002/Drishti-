@@ -8,15 +8,17 @@ from pathlib import Path
 import cv2
 import numpy as np
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 from ultralytics import YOLO
 
 ROOT = Path(__file__).resolve().parent
 TEST_DIR = ROOT / "test"
+ASSETS_DIR = ROOT / "assets"
 ANPR_ROOT = ROOT / "anpr_engine"
 sys.path.insert(0, str(ANPR_ROOT))
 
-from virtual_fence_engine import VirtualFenceEngine
+from virtual_fence_engine import VirtualFenceEngine, SurveillanceTracker
 
 try:
     from anpr import ANPREngine
@@ -25,11 +27,16 @@ except Exception:
 
 app = FastAPI(title="Drishti Monitoring MVP")
 
+if ASSETS_DIR.exists():
+    app.mount("/assets", StaticFiles(directory=str(ASSETS_DIR)), name="assets")
+
 SOURCES = {
     "virtual_fence": TEST_DIR / "virtual_fence.mp4",
     "vehicle_detection": TEST_DIR / "vehicle_detection.mp4",
     "human_detection": TEST_DIR / "human_deetection.mp4",
     "anpr": TEST_DIR / "Automatic Number Plate Recognition (ANPR) _ Vehicle Number Plate Recognition (1).mp4",
+    "suspicious_activity": TEST_DIR / "suspicious_activity.mp4",
+    "facial_recognition": 0,
 }
 
 frames = {name: None for name in SOURCES}
@@ -48,6 +55,8 @@ CAM_NAMES = {
     "vehicle_detection": "Cam 2",
     "human_detection": "Cam 3",
     "anpr": "Cam 4",
+    "suspicious_activity": "Cam 5",
+    "facial_recognition": "Cam 6",
 }
 
 # ── Event metadata tables ────────────────────────────────────────────────────
@@ -167,33 +176,48 @@ def vehicles(frame, model, feed):
     return output
 
 
-def humans(frame, model, feed):
+def humans(frame, model, tracker, feed):
     output = frame.copy()
     h, w = frame.shape[:2]
     dets = []
-    count = 0
+    try:
+        results = model(frame, conf=0.25, classes=[0], verbose=False)[0]
+    except Exception:
+        results = None
+
+    raw = []
+    if results is not None and results.boxes is not None:
+        for b in results.boxes:
+            conf = float(b.conf[0])
+            x1, y1, x2, y2 = map(int, b.xyxy[0])
+            if (y2 - y1) >= 25:  # Filter noise / tiny artifacts
+                raw.append({
+                    "bbox": (x1, y1, x2, y2),
+                    "conf": conf
+                })
+
+    tracked = tracker.update(raw) if tracker is not None else []
     max_conf = 0.0
-    for result in model(frame, conf=0.45, verbose=False):
-        if result.boxes is None:
-            continue
-        for detection in result.boxes:
-            count += 1
-            conf = float(detection.conf[0])
-            max_conf = max(max_conf, conf)
-            x1, y1, x2, y2 = map(int, detection.xyxy[0])
-            cv2.rectangle(output, (x1, y1), (x2, y2), (50, 205, 50), 1)
-            dets.append({
-                "x1": round(x1 / w, 4),
-                "y1": round(y1 / h, 4),
-                "w": round((x2 - x1) / w, 4),
-                "h": round((y2 - y1) / h, 4),
-                "label": f"person {conf:.2f}",
-                "type": "human",
-                "color": "#10b981"
-            })
-    if count:
-        event(feed, "HUMAN_DETECTED", f"{count} person(s) detected",
-              {"count": count}, confidence=max_conf, object_type="Person")
+
+    for d in tracked:
+        x1, y1, x2, y2 = d["bbox"]
+        tid = d["track_id"]
+        conf = d.get("conf", 0.8)
+        max_conf = max(max_conf, conf)
+        dets.append({
+            "x1": round(x1 / w, 4),
+            "y1": round(y1 / h, 4),
+            "w": round((x2 - x1) / w, 4),
+            "h": round((y2 - y1) / h, 4),
+            "label": f"Person #{tid}",
+            "type": "human",
+            "color": "#10b981"
+        })
+
+    if tracked:
+        event(feed, "HUMAN_DETECTED", f"{len(tracked)} person(s) detected",
+              {"count": len(tracked)}, confidence=max_conf, object_type="Person", cooldown=2.0)
+
     with detections_lock:
         latest_detections[feed] = dets
     return output
@@ -205,8 +229,9 @@ def fence(frame, engine, feed):
     dets = []
     for alert in alerts:
         event(feed, "INTRUSION_DETECTED",
-              f"Person crossed restricted zone (track {alert['track_id']})",
-              alert, 0.8, object_type="Person")
+              f"Person crossed restricted zone (track #{alert['track_id']})",
+              details=alert, confidence=float(alert.get("confidence", 0.8)),
+              object_type="Person", cooldown=1.5)
     
     for d in detections:
         x1, y1, x2, y2 = d["bbox"]
@@ -299,7 +324,220 @@ def anpr(frame, vehicle_model, plate_engine, feed):
     return output
 
 
+AUTHORIZED_FACE_VECTORS = []
+
+def init_face_recognition():
+    global AUTHORIZED_FACE_VECTORS
+    AUTHORIZED_FACE_VECTORS = []
+    cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+
+    ref_paths = [TEST_DIR / "facial_recognition.jpg"]
+    for p in TEST_DIR.glob("*.*"):
+        if p not in ref_paths and p.suffix.lower() in ('.jpg', '.jpeg', '.png') and ("face" in p.name.lower() or "person" in p.name.lower()):
+            ref_paths.append(p)
+
+    for ref_path in ref_paths:
+        if not ref_path.exists():
+            continue
+        ref_img = cv2.imread(str(ref_path))
+        if ref_img is None:
+            continue
+        gray = cv2.cvtColor(ref_img, cv2.COLOR_BGR2GRAY)
+        faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(50, 50))
+        if len(faces) > 0:
+            for (x, y, w, h) in faces:
+                face_crop = cv2.resize(gray[y:y+h, x:x+w], (64, 64)).astype(np.float32)
+                vec = (face_crop - np.mean(face_crop)) / (np.std(face_crop) + 1e-6)
+                AUTHORIZED_FACE_VECTORS.append(vec)
+        else:
+            face_crop = cv2.resize(gray, (64, 64)).astype(np.float32)
+            vec = (face_crop - np.mean(face_crop)) / (np.std(face_crop) + 1e-6)
+            AUTHORIZED_FACE_VECTORS.append(vec)
+
+
+def suspicious(frame, model, tracker, feed):
+    output = frame.copy()
+    h, w = frame.shape[:2]
+    dets = []
+
+    try:
+        results = model(frame, conf=0.28, classes=[0], verbose=False)[0]
+    except Exception:
+        results = None
+
+    raw = []
+    if results is not None and results.boxes is not None:
+        for b in results.boxes:
+            conf = float(b.conf[0])
+            x1, y1, x2, y2 = map(int, b.xyxy[0])
+            if (y2 - y1) >= 40:
+                raw.append({
+                    "bbox": (x1, y1, x2, y2),
+                    "conf": conf,
+                    "type": "person"
+                })
+
+    tracked = tracker.update(raw) if tracker is not None else []
+    max_conf = 0.0
+
+    for d in tracked:
+        x1, y1, x2, y2 = d["bbox"]
+        tid = d["track_id"]
+        conf = d.get("conf", 0.75)
+        max_conf = max(max_conf, conf)
+        # In Cam 5, any nocturnal presence in this restricted stairwell is flagged as suspicious activity
+        dets.append({
+            "x1": round(x1 / w, 4),
+            "y1": round(y1 / h, 4),
+            "w": round((x2 - x1) / w, 4),
+            "h": round((y2 - y1) / h, 4),
+            "label": f"SUSPICIOUS: Person #{tid} ({int(conf * 100)}%)",
+            "type": "suspicious",
+            "color": "#ef4444"
+        })
+
+    if tracked:
+        event(feed, "SUSPICIOUS", f"Suspicious Activity: Unauthorized entry in restricted stairwell (Person #{tracked[0]['track_id']})",
+              {"track_id": tracked[0]['track_id']}, confidence=max_conf, object_type="Person", cooldown=2.0)
+
+    with detections_lock:
+        latest_detections[feed] = dets
+    return output
+
+
+def facial_rec(frame, detector, feed):
+    output = frame.copy()
+    h, w = frame.shape[:2]
+    dets = []
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    faces = detector.detectMultiScale(gray, scaleFactor=1.15, minNeighbors=4, minSize=(50, 50))
+
+    for (x, y, fw, fh) in faces:
+        face_crop = cv2.resize(gray[y:y+fh, x:x+fw], (64, 64)).astype(np.float32)
+        norm_crop = (face_crop - np.mean(face_crop)) / (np.std(face_crop) + 1e-6)
+        sim = 0.0
+        if AUTHORIZED_FACE_VECTORS:
+            sims = [float(np.mean(norm_crop * v)) for v in AUTHORIZED_FACE_VECTORS]
+            sim = max(sims)
+
+        if sim >= 0.55:
+            label = "Facial Recognition Successful"
+            color = "#10b981"
+            det_type = "verified_face"
+            event(feed, "HUMAN_DETECTED", "Facial Recognition Successful: Authorized Face Verified",
+                  {"status": "Verified"}, confidence=round(sim, 2), object_type="Person", cooldown=3.0)
+        else:
+            label = "Face Not Recognised"
+            color = "#ef4444"
+            det_type = "unrecognized_face"
+            event(feed, "SUSPICIOUS", "Security Alert: Face Not Recognised",
+                  {"status": "Unrecognized"}, confidence=round(max(0.0, sim), 2), object_type="Person", cooldown=3.0)
+
+        dets.append({
+            "x1": round(x / w, 4),
+            "y1": round(y / h, 4),
+            "w": round(fw / w, 4),
+            "h": round(fh / h, 4),
+            "label": label,
+            "type": det_type,
+            "color": color
+        })
+
+    with detections_lock:
+        latest_detections[feed] = dets
+    return output
+
+
+def reset_tracker(processor):
+    try:
+        from ultralytics.trackers.basetrack import BaseTrack
+        BaseTrack._count = 0
+    except Exception:
+        pass
+    if hasattr(processor, "tracked_objects"):
+        processor.tracked_objects.clear()
+    model = getattr(processor, "model", processor)
+    if hasattr(model, "predictor") and model.predictor is not None:
+        if hasattr(model.predictor, "trackers"):
+            for trk in model.predictor.trackers:
+                try:
+                    trk.reset()
+                except Exception:
+                    pass
+
+
 def worker(feed, source):
+    # Handle live webcam feed for Cam 6 (Facial Recognition)
+    if feed == "facial_recognition":
+        try:
+            init_face_recognition()
+            detector = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+            capture = cv2.VideoCapture(0)
+            if not capture.isOpened():
+                # Fallback to static reference image if webcam 0 is unavailable
+                ref_fallback = TEST_DIR / "facial_recognition.jpg"
+                if ref_fallback.exists():
+                    img = cv2.imread(str(ref_fallback))
+                    statuses[feed]["running"] = True
+                    while not stop_event.is_set():
+                        frame = img.copy()
+                        output = facial_rec(frame, detector, feed)
+                        ok, encoded = cv2.imencode(".jpg", output, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                        if ok:
+                            with locks[feed]:
+                                frames[feed] = encoded.tobytes()
+                        time.sleep(0.1)
+                    return
+                else:
+                    raise RuntimeError("Webcam 0 could not be opened and no reference image found.")
+
+            capture.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            statuses[feed]["running"] = True
+            while not stop_event.is_set():
+                ok, frame = capture.read()
+                if not ok or frame is None:
+                    time.sleep(0.04)
+                    continue
+                output = facial_rec(frame, detector, feed)
+                ok, encoded = cv2.imencode(".jpg", output, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                if ok:
+                    with locks[feed]:
+                        frames[feed] = encoded.tobytes()
+                time.sleep(0.03)
+        except Exception as exc:
+            statuses[feed]["error"] = str(exc)
+            event(feed, "ERROR", str(exc), cooldown=0)
+        finally:
+            if 'capture' in locals() and hasattr(capture, 'isOpened') and capture.isOpened():
+                capture.release()
+        return
+
+    # Handle static image feeds
+    if isinstance(source, (str, Path)) and str(source).lower().endswith(('.jpg', '.jpeg', '.png')):
+        try:
+            init_face_recognition()
+            detector = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+            img = cv2.imread(str(source))
+            if img is None:
+                raise RuntimeError(f"Could not open image: {source}")
+            statuses[feed]["running"] = True
+            while not stop_event.is_set():
+                frame = img.copy()
+                if feed == "facial_recognition":
+                    output = facial_rec(frame, detector, feed)
+                else:
+                    output = frame
+                ok, encoded = cv2.imencode(".jpg", output, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                if ok:
+                    with locks[feed]:
+                        frames[feed] = encoded.tobytes()
+                time.sleep(0.1)
+        except Exception as exc:
+            statuses[feed]["error"] = str(exc)
+            event(feed, "ERROR", str(exc), cooldown=0)
+        return
+
     capture = cv2.VideoCapture(str(source))
     if not capture.isOpened():
         error = f"Could not open video: {source}"
@@ -314,13 +552,18 @@ def worker(feed, source):
     total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
 
     try:
+        tracker = None
         if feed == "virtual_fence":
-            polygon_pts = [(20, 40), (160, 40), (160, 230), (20, 230)]
+            polygon_pts = [(90, 125), (250, 125), (250, 235), (90, 235)]
             processor = VirtualFenceEngine(str(ROOT / "yolo11n.pt"), "polygon", polygon_pts, [0])
         elif feed == "vehicle_detection":
             processor = YOLO(str(ROOT / "yolo11n.pt"))
         elif feed == "human_detection":
-            processor = YOLO(str(ROOT / "yolo11n-pose.pt"))
+            processor = YOLO(str(ROOT / "yolo11n.pt"))
+            tracker = SurveillanceTracker(max_lost_frames=4, iou_thresh=0.2, dist_thresh=80)
+        elif feed == "suspicious_activity":
+            processor = YOLO(str(ROOT / "yolo11n.pt"))
+            tracker = SurveillanceTracker(max_lost_frames=4, iou_thresh=0.15, dist_thresh=90)
         else:
             processor = YOLO(str(ROOT / "yolo11n.pt"))
             model_path = ANPR_ROOT / "anpr" / "models" / "plate_detector.pt"
@@ -344,8 +587,12 @@ def worker(feed, source):
                 capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 start_wall_time = time.time()
                 target_frame = 0
-                if hasattr(processor, "tracked_objects"):
-                    processor.tracked_objects.clear()
+                if hasattr(processor, "reset"):
+                    processor.reset()
+                if tracker is not None:
+                    tracker.reset()
+                with detections_lock:
+                    latest_detections[feed] = []
 
             current_pos = int(capture.get(cv2.CAP_PROP_POS_FRAMES))
             if target_frame > current_pos + 1:
@@ -355,8 +602,12 @@ def worker(feed, source):
             if not ok:
                 capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 start_wall_time = time.time()
-                if hasattr(processor, "tracked_objects"):
-                    processor.tracked_objects.clear()
+                if hasattr(processor, "reset"):
+                    processor.reset()
+                if tracker is not None:
+                    tracker.reset()
+                with detections_lock:
+                    latest_detections[feed] = []
                 continue
 
             if feed == "virtual_fence":
@@ -364,7 +615,9 @@ def worker(feed, source):
             elif feed == "vehicle_detection":
                 output = vehicles(frame, processor, feed)
             elif feed == "human_detection":
-                output = humans(frame, processor, feed)
+                output = humans(frame, processor, tracker, feed)
+            elif feed == "suspicious_activity":
+                output = suspicious(frame, processor, tracker, feed)
             else:
                 output = anpr(frame, processor, plate_engine, feed)
 
@@ -409,6 +662,14 @@ def home():
     return HTMLResponse(HTML)
 
 
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    fav_path = ASSETS_DIR / "favion.png"
+    if fav_path.exists():
+        return FileResponse(fav_path)
+    return HTMLResponse("", status_code=404)
+
+
 @app.get("/feed/{feed}")
 def feed(feed: str):
     if feed not in SOURCES:
@@ -419,7 +680,7 @@ def feed(feed: str):
 fence_metadata = {
     "type": "polygon",
     "label": "Restricted Zone",
-    "points": [[6.25, 16.67], [50.0, 16.67], [50.0, 95.83], [6.25, 95.83]]
+    "points": [[28.125, 52.08], [78.125, 52.08], [78.125, 97.92], [28.125, 97.92]]
 }
 
 
@@ -429,7 +690,33 @@ def status():
         ev_list = list(events)
     with detections_lock:
         det_map = dict(latest_detections)
-    return {"feeds": statuses, "events": ev_list, "detections": det_map, "fence": fence_metadata}
+    active_breaches = []
+    for feed_key, dets in det_map.items():
+        if feed_key == "virtual_fence" and any(d.get("type") == "intruder" for d in dets):
+            active_breaches.append({
+                "feed": feed_key,
+                "cam": CAM_NAMES.get(feed_key, feed_key),
+                "title": "Breach Detected",
+            })
+        elif feed_key == "suspicious_activity" and any(d.get("type") == "suspicious" for d in dets):
+            active_breaches.append({
+                "feed": feed_key,
+                "cam": CAM_NAMES.get(feed_key, feed_key),
+                "title": "Breach Detected",
+            })
+        elif feed_key == "facial_recognition" and any(d.get("type") == "unrecognized_face" for d in dets):
+            active_breaches.append({
+                "feed": feed_key,
+                "cam": CAM_NAMES.get(feed_key, feed_key),
+                "title": "Breach Detected",
+            })
+    return {
+        "feeds": statuses,
+        "events": ev_list,
+        "detections": det_map,
+        "fence": fence_metadata,
+        "active_breaches": active_breaches,
+    }
 
 
 @app.get("/api/events")
@@ -444,7 +731,9 @@ HTML = """
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Drishti Monitoring</title>
+  <title>Drishti · Intelligent Border Video Analytics Platform</title>
+  <link rel="icon" type="image/png" href="/assets/favion.png">
+  <link rel="shortcut icon" type="image/png" href="/assets/favion.png">
   <style>
     :root {
       --bg: #f8fafc;
@@ -454,48 +743,119 @@ HTML = """
       --text-muted: #64748b;
       --accent: #2563eb;
       --live-green: #22c55e;
-      --font-stack: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      --font-stack: "Times New Roman", Times, Georgia, serif;
     }
-    * { box-sizing: border-box; }
+    * {
+      box-sizing: border-box;
+      font-family: "Times New Roman", Times, Georgia, serif !important;
+    }
     body {
       margin: 0;
       padding: 0;
       background: var(--bg);
       color: var(--text-main);
-      font-family: var(--font-stack);
+      font-family: var(--font-stack) !important;
       -webkit-font-smoothing: antialiased;
     }
+    .top-nav-container {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+    }
+    /* ── GOI National Official Identity Bar ── */
+    .gov-strip {
+      background: #0b1329;
+      color: #e2e8f0;
+      font-size: 11.5px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    }
+    .gov-strip-inner {
+      display: flex;
+      align-items: center;
+      padding: 5px 24px;
+      max-width: 1400px;
+      margin: 0 auto;
+    }
+    .gov-left {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .gov-flag-icon {
+      font-size: 17px;
+      line-height: 1;
+      display: inline-block;
+    }
+    .gov-badge-in {
+      font-weight: 700;
+      color: #fdba74;
+    }
+    .gov-divider {
+      color: #475569;
+    }
+    .gov-bullet {
+      color: #64748b;
+      font-size: 7px;
+    }
+    .gov-mha {
+      color: #94a3b8;
+    }
+    .gov-tricolor {
+      height: 4px;
+      width: 100%;
+      background: linear-gradient(90deg, #FF9933 0%, #FF9933 33.33%, #FFFFFF 33.33%, #FFFFFF 66.66%, #138808 66.66%, #138808 100%);
+    }
+
     header {
       display: flex;
       justify-content: space-between;
       align-items: center;
-      padding: 14px 24px;
+      padding: 10px 24px;
       background: #ffffff;
       border-bottom: 1px solid var(--border);
-      position: sticky;
-      top: 0;
-      z-index: 10;
     }
     .brand {
       display: flex;
       align-items: center;
-      gap: 10px;
+      gap: 14px;
     }
-    .brand h1 {
-      font-size: 18px;
-      font-weight: 600;
+    .brand-logo {
+      height: 40px;
+      width: auto;
+      max-width: 150px;
+      object-fit: contain;
+      display: block;
+    }
+    .brand-text {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+    .brand-title {
+      font-size: 17px;
+      font-weight: 700;
       margin: 0;
       color: var(--text-main);
+      line-height: 1.2;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .brand-sub {
+      font-size: 11px;
+      color: var(--text-muted);
+      font-weight: 500;
+      letter-spacing: 0.02em;
     }
     .badge-live {
       display: inline-flex;
       align-items: center;
       gap: 5px;
-      font-size: 12px;
-      font-weight: 500;
+      font-size: 11px;
+      font-weight: 600;
       color: #15803d;
       background: #f0fdf4;
-      padding: 2px 8px;
+      padding: 2px 7px;
       border-radius: 12px;
       border: 1px solid #bbf7d0;
     }
@@ -506,6 +866,12 @@ HTML = """
       border-radius: 50%;
       display: inline-block;
     }
+
+    .header-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
     .btn {
       display: inline-flex;
       align-items: center;
@@ -514,13 +880,32 @@ HTML = """
       color: #ffffff;
       border: none;
       border-radius: 6px;
-      padding: 8px 14px;
-      font-size: 13px;
+      padding: 7px 13px;
+      font-size: 12.5px;
       font-weight: 500;
       cursor: pointer;
       transition: background 0.15s ease;
     }
     .btn:hover { background: #1e293b; }
+    .btn-export {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: #ffffff;
+      color: #0f172a;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 6px 12px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+    .btn-export:hover {
+      background: #f1f5f9;
+      border-color: #cbd5e1;
+      color: #0f172a;
+    }
     .event-count-badge {
       background: var(--accent);
       color: #ffffff;
@@ -529,6 +914,85 @@ HTML = """
       padding: 1px 6px;
       border-radius: 10px;
     }
+
+    /* ── Tactical Red Alert Threat Banner ── */
+    .alert-banner {
+      background: linear-gradient(90deg, #991b1b 0%, #b91c1c 50%, #991b1b 100%);
+      color: #ffffff;
+      border-bottom: 2px solid #ef4444;
+      animation: alertPulse 2.5s infinite ease-in-out;
+      box-shadow: 0 4px 14px rgba(185, 28, 28, 0.3);
+    }
+    @keyframes alertPulse {
+      0% { background-color: #991b1b; }
+      50% { background-color: #dc2626; }
+      100% { background-color: #991b1b; }
+    }
+    .alert-banner-inner {
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 6px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .alert-left-group {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .alert-pulse-icon {
+      font-size: 16px;
+      animation: iconThrob 1s infinite alternate;
+    }
+    @keyframes iconThrob {
+      from { transform: scale(1); }
+      to { transform: scale(1.2); }
+    }
+    .alert-message {
+      font-size: 13px;
+      font-weight: 700;
+      color: #ffffff;
+      letter-spacing: 0.02em;
+    }
+    .alert-controls {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .alert-action-btn {
+      background: #ffffff;
+      color: #991b1b;
+      border: none;
+      padding: 4px 12px;
+      font-size: 12px;
+      font-weight: 700;
+      border-radius: 4px;
+      cursor: pointer;
+      transition: background 0.15s;
+      white-space: nowrap;
+    }
+    .alert-action-btn:hover {
+      background: #fef2f2;
+    }
+
+    /* Drawer Header Actions */
+    .drawer-title-wrap {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+    .drawer-subtitle {
+      font-size: 11px;
+      color: var(--text-muted);
+      font-weight: 500;
+    }
+    .drawer-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
     main {
       max-width: 1400px;
       margin: 24px auto;
@@ -536,8 +1000,8 @@ HTML = """
     }
     .grid {
       display: grid;
-      grid-template-columns: repeat(2, 1fr);
-      gap: 20px;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 16px;
     }
     .card {
       background: var(--card-bg);
@@ -545,12 +1009,23 @@ HTML = """
       border-radius: 8px;
       overflow: hidden;
       box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
-      transition: transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease;
+      transition: transform 0.15s ease, box-shadow 0.25s ease, border-color 0.25s ease;
       cursor: pointer;
     }
     .card:hover {
       border-color: #cbd5e1;
       box-shadow: 0 4px 12px rgba(0, 0, 0, 0.06);
+    }
+    /* Subtle pulsing red glow on camera card when an active breach is happening */
+    .card.breach-glow {
+      border-color: #ef4444 !important;
+      box-shadow: 0 0 0 2px #ef4444, 0 0 22px rgba(239, 68, 68, 0.45) !important;
+      animation: cardBreachPulse 1.8s infinite ease-in-out;
+    }
+    @keyframes cardBreachPulse {
+      0% { box-shadow: 0 0 0 2px #ef4444, 0 0 8px rgba(239, 68, 68, 0.35); }
+      50% { box-shadow: 0 0 0 2.5px #dc2626, 0 0 22px rgba(239, 68, 68, 0.6); }
+      100% { box-shadow: 0 0 0 2px #ef4444, 0 0 8px rgba(239, 68, 68, 0.35); }
     }
     .card-header {
       display: flex;
@@ -578,7 +1053,7 @@ HTML = """
     .feed-wrapper img {
       width: 100%;
       height: 100%;
-      object-fit: cover;
+      object-fit: fill;
       display: block;
     }
 
@@ -899,41 +1374,81 @@ HTML = """
       object-fit: cover;
     }
 
+    @media (max-width: 1100px) {
+      .grid { grid-template-columns: repeat(2, 1fr); }
+    }
     @media (max-width: 768px) {
       .grid { grid-template-columns: 1fr; }
     }
   </style>
 </head>
 <body>
-  <header>
-    <div class="brand">
-      <h1>Drishti Monitoring</h1>
-      <span class="badge-live"><span class="dot"></span> Live</span>
+  <div class="top-nav-container">
+    <!-- GOI National Official Identity Bar -->
+    <div class="gov-strip">
+      <div class="gov-strip-inner">
+        <div class="gov-left">
+          <span class="gov-flag-icon">🇮🇳</span>
+          <span class="gov-badge-in">भारत सरकार</span>
+          <span class="gov-divider">|</span>
+          <span>Government of India</span>
+          <span class="gov-bullet">•</span>
+          <span class="gov-mha">Ministry of Home Affairs (MHA)</span>
+        </div>
+      </div>
+      <div class="gov-tricolor"></div>
     </div>
-    <div class="header-actions">
-      <button class="btn" id="openEventsBtn">
-        Events <span class="event-count-badge" id="eventBadge">0</span>
-      </button>
+
+    <!-- Main Navigation Bar -->
+    <header>
+      <div class="brand">
+        <img src="/assets/product_logo.png" alt="Drishti Logo" class="brand-logo">
+        <div class="brand-text">
+          <h1 class="brand-title">Drishti Monitoring <span class="badge-live"><span class="dot"></span> Live</span></h1>
+          <span class="brand-sub">Intelligent Border Video Analytics Platform</span>
+        </div>
+      </div>
+
+      <div class="header-actions">
+        <button class="btn-export" onclick="exportIncidentLog()" title="Export Incident Log (CSV)">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          Export Log
+        </button>
+        <button class="btn" id="openEventsBtn">Events</button>
+      </div>
+    </header>
+
+    <!-- Tactical Red Alert Threat Banner (Active Breaches Only) -->
+    <div class="alert-banner" id="alertBanner" style="display: none;">
+      <div class="alert-banner-inner">
+        <div class="alert-left-group">
+          <div class="alert-pulse-icon">⚠️</div>
+          <div class="alert-message" id="alertBannerMsg">Cam 1 · Breach Detected</div>
+        </div>
+        <div class="alert-controls">
+          <button class="alert-action-btn" onclick="inspectAlertFeed()">Inspect Feed</button>
+        </div>
+      </div>
     </div>
-  </header>
+  </div>
 
   <main>
     <div class="grid">
-      <div class="card" onclick="openEnlarged('virtual_fence', 'Cam 1')">
+      <div class="card" id="card-virtual_fence" onclick="openEnlarged('virtual_fence', 'Cam 1')">
         <div class="card-header">
           <h2>Cam 1</h2>
         </div>
         <div class="feed-wrapper">
           <img src="/feed/virtual_fence" alt="Cam 1 Feed">
           <svg class="fence-svg" viewBox="0 0 100 100" preserveAspectRatio="none">
-            <polygon points="6.25,16.67 50,16.67 50,95.83 6.25,95.83" fill="rgba(239, 68, 68, 0.18)" stroke="#ef4444" stroke-width="1.8" />
-            <text x="7.5" y="21.5" fill="#ef4444" font-size="3.5" font-weight="600" font-family="system-ui">Restricted Zone</text>
+            <polygon points="28.125,52.08 78.125,52.08 78.125,97.92 28.125,97.92" fill="rgba(239, 68, 68, 0.18)" stroke="#ef4444" stroke-width="1.8" />
+            <text x="30" y="58" fill="#ef4444" font-size="3.5" font-weight="600" font-family="Times New Roman, serif">Restricted Zone</text>
           </svg>
           <div class="bbox-layer" id="bbox-virtual_fence"></div>
         </div>
       </div>
 
-      <div class="card" onclick="openEnlarged('vehicle_detection', 'Cam 2')">
+      <div class="card" id="card-vehicle_detection" onclick="openEnlarged('vehicle_detection', 'Cam 2')">
         <div class="card-header">
           <h2>Cam 2</h2>
         </div>
@@ -943,7 +1458,7 @@ HTML = """
         </div>
       </div>
 
-      <div class="card" onclick="openEnlarged('human_detection', 'Cam 3')">
+      <div class="card" id="card-human_detection" onclick="openEnlarged('human_detection', 'Cam 3')">
         <div class="card-header">
           <h2>Cam 3</h2>
         </div>
@@ -953,7 +1468,7 @@ HTML = """
         </div>
       </div>
 
-      <div class="card" onclick="openEnlarged('anpr', 'Cam 4')">
+      <div class="card" id="card-anpr" onclick="openEnlarged('anpr', 'Cam 4')">
         <div class="card-header">
           <h2>Cam 4</h2>
         </div>
@@ -962,14 +1477,43 @@ HTML = """
           <div class="bbox-layer" id="bbox-anpr"></div>
         </div>
       </div>
+
+      <div class="card" id="card-suspicious_activity" onclick="openEnlarged('suspicious_activity', 'Cam 5')">
+        <div class="card-header">
+          <h2>Cam 5</h2>
+        </div>
+        <div class="feed-wrapper">
+          <img src="/feed/suspicious_activity" alt="Cam 5 Feed">
+          <div class="bbox-layer" id="bbox-suspicious_activity"></div>
+        </div>
+      </div>
+
+      <div class="card" id="card-facial_recognition" onclick="openEnlarged('facial_recognition', 'Cam 6')">
+        <div class="card-header">
+          <h2>Cam 6</h2>
+        </div>
+        <div class="feed-wrapper">
+          <img src="/feed/facial_recognition" alt="Cam 6 Feed">
+          <div class="bbox-layer" id="bbox-facial_recognition"></div>
+        </div>
+      </div>
     </div>
   </main>
 
   <div class="drawer-overlay" id="drawerOverlay" onclick="closeEvents()"></div>
   <div class="drawer" id="eventsDrawer">
     <div class="drawer-header">
-      <h3>Event Log</h3>
-      <button class="close-btn" onclick="closeEvents()">&times;</button>
+      <div class="drawer-title-wrap">
+        <h3>Incident Event Log</h3>
+        <span class="drawer-subtitle">Border Security Evidence Stream</span>
+      </div>
+      <div class="drawer-actions">
+        <button class="btn-export" onclick="exportIncidentLog()" title="Export log as CSV">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          Export CSV
+        </button>
+        <button class="close-btn" onclick="closeEvents()">&times;</button>
+      </div>
     </div>
     <div class="drawer-body" id="eventsList">
       <p style="color: var(--text-muted); font-size: 13px;">No events recorded yet.</p>
@@ -996,10 +1540,65 @@ HTML = """
     const modalOverlay = document.getElementById('modalOverlay');
     const modalTitle = document.getElementById('modalTitle');
     const enlargedImg = document.getElementById('enlargedImg');
-    const eventBadge = document.getElementById('eventBadge');
     const eventsList = document.getElementById('eventsList');
     const modalFenceLayer = document.getElementById('modalFenceLayer');
     let activeEnlargedKey = null;
+    let allEventsData = [];
+    const dismissedAlerts = new Set();
+    let currentAlertEvent = null;
+
+
+    // ── Tactical Red Alert Banner ──
+    let currentAlertFeed = 'virtual_fence';
+
+    function inspectAlertFeed() {
+      if (currentAlertFeed) {
+        const camMap = {
+          'virtual_fence': 'Cam 1',
+          'vehicle_detection': 'Cam 2',
+          'human_detection': 'Cam 3',
+          'anpr': 'Cam 4',
+          'suspicious_activity': 'Cam 5',
+          'facial_recognition': 'Cam 6'
+        };
+        const camLabel = camMap[currentAlertFeed] || currentAlertFeed;
+        openEnlarged(currentAlertFeed, camLabel);
+      }
+    }
+
+    // ── Export Incident Log (CSV) ──
+    function exportIncidentLog() {
+      if (!allEventsData || allEventsData.length === 0) {
+        alert("No incident events recorded yet to export.");
+        return;
+      }
+      const headers = ["Log ID", "Date", "Time IST", "Camera", "Event Type", "Object", "Plate Number", "Confidence", "Severity", "Status", "Details"];
+      const rows = allEventsData.map((e, idx) => {
+        const date = e.timestamp ? e.timestamp.split(' ')[0] : '';
+        const time = e.time || (e.timestamp ? e.timestamp.split(' ')[1] : '');
+        const conf = e.confidence != null ? `${Math.round(e.confidence * 100)}%` : '';
+        const plate = e.plate_number ? `"${e.plate_number}"` : '';
+        const msg = `"${(e.message || '').replace(/"/g, '""')}"`;
+        return [idx + 1, date, time, e.feed || '', e.event_type || '', e.object || '', plate, conf, e.severity || '', e.status || 'Active', msg];
+      });
+
+      const csvContent = "\\uFEFF" + [
+        headers.join(','),
+        ...rows.map(r => r.join(','))
+      ].join('\\r\\n');
+
+      const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      const now = new Date();
+      const dateTag = now.toISOString().replace(/[:.]/g, '-').slice(0, 19);
+      a.href = url;
+      a.download = `Drishti_Incident_Log_${dateTag}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    }
 
     document.getElementById('openEventsBtn').addEventListener('click', () => {
       eventsDrawer.classList.add('active');
@@ -1018,8 +1617,8 @@ HTML = """
       if (feedKey === 'virtual_fence') {
         modalFenceLayer.innerHTML = `
           <svg class="fence-svg" viewBox="0 0 100 100" preserveAspectRatio="none">
-            <polygon points="6.25,16.67 50,16.67 50,95.83 6.25,95.83" fill="rgba(239, 68, 68, 0.18)" stroke="#ef4444" stroke-width="1.8" />
-            <text x="7.5" y="21.5" fill="#ef4444" font-size="3.5" font-weight="600" font-family="system-ui">Restricted Zone</text>
+            <polygon points="28.125,52.08 78.125,52.08 78.125,97.92 28.125,97.92" fill="rgba(239, 68, 68, 0.18)" stroke="#ef4444" stroke-width="1.8" />
+            <text x="30" y="58" fill="#ef4444" font-size="3.5" font-weight="600" font-family="Times New Roman, serif">Restricted Zone</text>
           </svg>
         `;
       } else {
@@ -1079,84 +1678,120 @@ HTML = """
       container.innerHTML = html;
     }
 
+    let lastRenderedEventKey = '';
     async function refreshStatus() {
       try {
         const response = await fetch('/api/status');
         const data = await response.json();
         
         const events = data.events || [];
-        eventBadge.textContent = events.length;
-        if (events.length === 0) {
-          eventsList.innerHTML = '<p style="color: var(--text-muted); font-size: 13px;">No events recorded yet.</p>';
-        } else {
-          eventsList.innerHTML = '';
-          const PILL_CLASS = {
-            'Person Detected':   'pill-person',
-            'Vehicle Detected':  'pill-vehicle',
-            'ANPR Detected':     'pill-anpr',
-            'Fence Breach':      'pill-fence',
-            'Suspicious Activity': 'pill-suspicious',
-            'Camera/System Alert': 'pill-system',
-          };
-          const SEV_CLASS = { High: 'sev-high', Medium: 'sev-medium', Low: 'sev-low' };
-          events.forEach(e => {
-            const pillCls = PILL_CLASS[e.event_type] || 'pill-system';
-            const sevCls  = SEV_CLASS[e.severity] || 'sev-low';
-            const confPct = e.confidence != null ? Math.round(e.confidence * 100) : null;
-            const snapHtml = e.snapshot
-              ? `<img src="data:image/jpeg;base64,${e.snapshot}" alt="snap">`
-              : `<div class="event-snapshot-placeholder">No<br>Preview</div>`;
+        allEventsData = events;
 
-            const card = document.createElement('div');
-            card.className = 'event-card';
-            card.innerHTML = `
-              <div class="event-card-header">
-                <div class="severity-dot ${sevCls}"></div>
-                <span class="event-type-pill ${pillCls}">${escapeHtml(e.event_type)}</span>
-                <span class="event-header-time">${escapeHtml(e.feed)} · ${escapeHtml(e.time)}</span>
-              </div>
-              <div class="event-card-body">
-                <div class="event-snapshot">${snapHtml}</div>
-                <div class="event-meta">
-                  <div class="event-meta-grid">
-                    <div class="meta-row">
-                      <span class="meta-label">Camera</span>
-                      <span class="meta-value">${escapeHtml(e.feed)}</span>
-                    </div>
-                    <div class="meta-row">
-                      <span class="meta-label">Time</span>
-                      <span class="meta-value">${escapeHtml(e.time)}</span>
-                    </div>
-                    <div class="meta-row">
-                      <span class="meta-label">Object</span>
-                      <span class="meta-value">${escapeHtml(e.object || '—')}</span>
-                    </div>
-                    <div class="meta-row">
-                      <span class="meta-label">Severity</span>
-                      <span class="meta-value">${escapeHtml(e.severity)}</span>
-                    </div>
-                  </div>
-                  ${e.plate_number ? `
-                  <div class="meta-row" style="margin-top:4px;">
-                    <span class="meta-label">Plate Number</span>
-                    <span class="plate-value">${escapeHtml(e.plate_number)}</span>
-                  </div>` : ''}
-                  ${confPct != null ? `
-                  <div class="meta-row" style="margin-top:4px;">
-                    <span class="meta-label">Confidence</span>
-                    <div class="conf-bar-wrap">
-                      <div class="conf-bar"><div class="conf-bar-fill" style="width:${confPct}%"></div></div>
-                      <span class="meta-value">${confPct}%</span>
-                    </div>
-                  </div>` : ''}
-                  <div class="meta-row" style="margin-top:4px;">
-                    <span class="meta-label">Status</span>
-                    <span class="meta-value">${escapeHtml(e.status || 'Active')}</span>
-                  </div>
+        // Tactical Red Alert Banner & Camera Card Glow (ONLY when active breach is happening right now!)
+        const activeBreaches = data.active_breaches || [];
+        const isBreached = activeBreaches.length > 0;
+        const banner = document.getElementById('alertBanner');
+        const bannerMsg = document.getElementById('alertBannerMsg');
+
+        // Apply / remove subtle red glow on each camera card
+        ['virtual_fence', 'vehicle_detection', 'human_detection', 'anpr', 'suspicious_activity', 'facial_recognition'].forEach(fk => {
+          const cardEl = document.getElementById('card-' + fk);
+          if (cardEl) {
+            const hasBreach = activeBreaches.some(b => b.feed === fk);
+            if (hasBreach) {
+              cardEl.classList.add('breach-glow');
+            } else {
+              cardEl.classList.remove('breach-glow');
+            }
+          }
+        });
+
+        // Banner only appears when there is an active breach happening right now
+        if (isBreached) {
+          const alertTexts = activeBreaches.map(b => `${b.cam} · ${b.title || 'Breach Detected'}`).join('  |  ');
+          if (bannerMsg) bannerMsg.textContent = alertTexts;
+          currentAlertFeed = activeBreaches[0].feed;
+          if (banner) banner.style.display = 'block';
+        } else {
+          if (banner) banner.style.display = 'none';
+        }
+
+        // Only rebuild DOM if the event list actually changed
+        const currentEventKey = events.length > 0 ? (events[0].timestamp + '_' + events.length) : 'empty';
+        if (currentEventKey !== lastRenderedEventKey) {
+          lastRenderedEventKey = currentEventKey;
+          if (events.length === 0) {
+            eventsList.innerHTML = '<p style="color: var(--text-muted); font-size: 13px;">No events recorded yet.</p>';
+          } else {
+            eventsList.innerHTML = '';
+            const PILL_CLASS = {
+              'Person Detected':   'pill-person',
+              'Vehicle Detected':  'pill-vehicle',
+              'ANPR Detected':     'pill-anpr',
+              'Fence Breach':      'pill-fence',
+              'Suspicious Activity': 'pill-suspicious',
+              'Camera/System Alert': 'pill-system',
+            };
+            const SEV_CLASS = { High: 'sev-high', Medium: 'sev-medium', Low: 'sev-low' };
+            events.forEach(e => {
+              const pillCls = PILL_CLASS[e.event_type] || 'pill-system';
+              const sevCls  = SEV_CLASS[e.severity] || 'sev-low';
+              const confPct = e.confidence != null ? Math.round(e.confidence * 100) : null;
+              const snapHtml = e.snapshot
+                ? `<img src="data:image/jpeg;base64,${e.snapshot}" alt="snap">`
+                : `<div class="event-snapshot-placeholder">No<br>Preview</div>`;
+
+              const card = document.createElement('div');
+              card.className = 'event-card';
+              card.innerHTML = `
+                <div class="event-card-header">
+                  <div class="severity-dot ${sevCls}"></div>
+                  <span class="event-type-pill ${pillCls}">${escapeHtml(e.event_type)}</span>
+                  <span class="event-header-time">${escapeHtml(e.feed)} · ${escapeHtml(e.time)}</span>
                 </div>
-              </div>`;
-            eventsList.appendChild(card);
-          });
+                <div class="event-card-body">
+                  <div class="event-snapshot">${snapHtml}</div>
+                  <div class="event-meta">
+                    <div class="event-meta-grid">
+                      <div class="meta-row">
+                        <span class="meta-label">Camera</span>
+                        <span class="meta-value">${escapeHtml(e.feed)}</span>
+                      </div>
+                      <div class="meta-row">
+                        <span class="meta-label">Time</span>
+                        <span class="meta-value">${escapeHtml(e.time)}</span>
+                      </div>
+                      <div class="meta-row">
+                        <span class="meta-label">Object</span>
+                        <span class="meta-value">${escapeHtml(e.object || '—')}</span>
+                      </div>
+                      <div class="meta-row">
+                        <span class="meta-label">Severity</span>
+                        <span class="meta-value">${escapeHtml(e.severity)}</span>
+                      </div>
+                    </div>
+                    ${e.plate_number ? `
+                    <div class="meta-row" style="margin-top:4px;">
+                      <span class="meta-label">Plate Number</span>
+                      <span class="plate-value">${escapeHtml(e.plate_number)}</span>
+                    </div>` : ''}
+                    ${confPct != null ? `
+                    <div class="meta-row" style="margin-top:4px;">
+                      <span class="meta-label">Confidence</span>
+                      <div class="conf-bar-wrap">
+                        <div class="conf-bar"><div class="conf-bar-fill" style="width:${confPct}%"></div></div>
+                        <span class="meta-value">${confPct}%</span>
+                      </div>
+                    </div>` : ''}
+                    <div class="meta-row" style="margin-top:4px;">
+                      <span class="meta-label">Status</span>
+                      <span class="meta-value">${escapeHtml(e.status || 'Active')}</span>
+                    </div>
+                  </div>
+                </div>`;
+              eventsList.appendChild(card);
+            });
+          }
         }
 
         const detections = data.detections || {};
@@ -1172,8 +1807,13 @@ HTML = """
     }
 
     refreshStatus();
-    setInterval(refreshStatus, 100);
+    setInterval(refreshStatus, 60);
   </script>
 </body>
 </html>
 """
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("fastapi_dashboard:app", host="0.0.0.0", port=8000, reload=False)
+

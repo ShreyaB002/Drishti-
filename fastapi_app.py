@@ -5,15 +5,21 @@ from pathlib import Path
 import cv2
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from virtual_fence_engine import VirtualFenceEngine
 
 ROOT = Path(__file__).resolve().parent
+ASSETS_DIR = ROOT / "assets"
 MODEL_PATH = str(ROOT / "yolo11n.pt")
 CAMERA_SOURCE = 0
 
 app = FastAPI(title="Drishti Virtual Fence")
+
+if ASSETS_DIR.exists():
+    app.mount("/assets", StaticFiles(directory=str(ASSETS_DIR)), name="assets")
+
 engine = VirtualFenceEngine(
     model_path=MODEL_PATH,
     fence_type="line",

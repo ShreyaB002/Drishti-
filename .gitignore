@@ -32,6 +32,8 @@ build/
 *.pkl
 *.bin
 *.safetensors
+*.engine
+*.weights
 yolo11n-pose/
 vehicle_classifier.pt/
 
@@ -41,6 +43,8 @@ vehicle_classifier.pt/
 *.mov
 *.mkv
 *.webm
+*.flv
+*.wmv
 
 # ── Jupyter Notebook outputs ───────────────────────────────────────────────────
 .ipynb_checkpoints/
@@ -50,15 +54,21 @@ vehicle_classifier.pt/
 .DS_Store?
 ._*
 Thumbs.db
+ehthumbs.db
 desktop.ini
+Desktop.ini
+$RECYCLE.BIN/
 
 # ── IDE / editor configs ──────────────────────────────────────────────────────
-.vscode/settings.json
-.vscode/launch.json
+.vscode/
 .idea/
+*.swp
+*.swo
+*~
 
 # ── Secrets & environment variables ──────────────────────────────────────────
 *.env
+*.env.*
 secrets.py
 config_local.py
 
@@ -67,9 +77,16 @@ config_local.py
 *.tmp
 *.bak
 logs/
+temp/
+tmp/
+scratch/
+event_log_*.csv
 
 # ── PaddleOCR / EasyOCR / Ultralytics cache ────────────────────────────────────
 inference/
 .paddleocr/
 .EasyOCR/
 runs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
