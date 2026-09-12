@@ -52,8 +52,13 @@ class PlateDetector:
             ) from exc
 
         try:
+            import torch
+            self._device = "cuda:0" if torch.cuda.is_available() else "cpu"
+            self._half = self._device.startswith("cuda")
             self._model = YOLO(self.config.plate_detector_weights)
-            logger.info("Loaded plate detection model from %s", self.config.plate_detector_weights)
+            if self._half:
+                self._model.to(self._device)
+            logger.info("Loaded plate detection model from %s on %s (half=%s)", self.config.plate_detector_weights, self._device, self._half)
         except Exception as exc:
             logger.error("Failed to load plate detector weights: %s", exc)
             raise
@@ -88,6 +93,8 @@ class PlateDetector:
                 source=vehicle_crop,
                 conf=self.config.plate_detection_conf_threshold,
                 iou=self.config.plate_detection_iou_threshold,
+                device=self._device,
+                half=self._half,
                 verbose=False,
             )
         except Exception as exc:

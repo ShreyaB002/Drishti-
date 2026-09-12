@@ -119,7 +119,7 @@ class ANPRConfig:
     ocr_engine: str = "paddleocr"  # "paddleocr" | "easyocr"
     ocr_lang: str = "en"
     ocr_min_confidence: float = 0.3  # below this, discard the read entirely
-    ocr_use_gpu: bool = False
+    ocr_use_gpu: bool = True
 
     # ---- Validation ----
     plate_formats: List[PlateFormat] = field(

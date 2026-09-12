@@ -130,12 +130,20 @@ class VirtualFenceEngine:
     A modular, drop-in engine for Virtual Fence Intrusion Detection in CCTV streams.
     Can be easily integrated into any existing web server, desktop app, or pipeline.
     """
-    def __init__(self, model_path="yolo11n.pt", fence_type="polygon", fence_coords=None, target_classes=None):
+    def __init__(self, model_path="yolo11n.pt", fence_type="polygon", fence_coords=None, target_classes=None, device=None):
         self.logger = logging.getLogger(__name__)
         if YOLO is None:
             raise RuntimeError("YOLO is not installed.")
             
+        import torch
+        if device is None:
+            device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        self.device = device
+        self.half = self.device.startswith("cuda")
         self.model = YOLO(model_path)
+        if self.half:
+            self.model.to(self.device)
+
         self.fence_type = fence_type
         if fence_type == "line":
             if fence_coords is not None and len(fence_coords) != 2:
@@ -196,7 +204,7 @@ class VirtualFenceEngine:
         
         # 1. Detect with lower confidence to catch smaller/partial persons in 320x240
         try:
-            results = self.model(frame, classes=self.target_classes, conf=0.30, verbose=False)[0]
+            results = self.model(frame, classes=self.target_classes, conf=0.30, device=self.device, half=self.half, verbose=False)[0]
         except Exception:
             results = None
 

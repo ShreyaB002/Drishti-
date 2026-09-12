@@ -11,6 +11,11 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from ultralytics import YOLO
+import torch
+
+DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
+USE_HALF = DEVICE.startswith("cuda")
+print(f"[Drishti Engine] Active Compute Device: {DEVICE} (FP16 Half-Precision: {USE_HALF})")
 
 ROOT = Path(__file__).resolve().parent
 TEST_DIR = ROOT / "test"
@@ -140,7 +145,7 @@ def vehicles(frame, model, feed):
     dets = []
     count = 0
     max_conf = 0.0
-    for result in model(frame, conf=0.4, verbose=False):
+    for result in model(frame, conf=0.4, device=DEVICE, half=USE_HALF, verbose=False):
         if result.boxes is None:
             continue
         for detection in result.boxes:
@@ -174,7 +179,7 @@ def humans(frame, model, tracker, feed):
     h, w = frame.shape[:2]
     dets = []
     try:
-        results = model(frame, conf=0.22, classes=[0], verbose=False)[0]
+        results = model(frame, conf=0.22, classes=[0], device=DEVICE, half=USE_HALF, verbose=False)[0]
     except Exception:
         results = None
 
@@ -246,16 +251,17 @@ def fence(frame, engine, feed):
     return output
 
 
-def anpr(frame, vehicle_model, plate_engine, feed):
+def anpr(frame, vehicle_model, plate_engine, feed, frame_idx=0, plate_cache=None):
     output = frame.copy()
     h, w = frame.shape[:2]
     dets = []
-    # Use track() so each vehicle gets a stable integer track_id across frames
-    # which enables temporal fusion to accumulate OCR observations correctly.
+    if plate_cache is None:
+        plate_cache = {}
+
     try:
-        results = vehicle_model.track(frame, conf=0.4, persist=True, verbose=False)
+        results = vehicle_model.track(frame, conf=0.4, persist=True, device=DEVICE, half=USE_HALF, verbose=False)
     except Exception:
-        results = vehicle_model(frame, conf=0.4, verbose=False)
+        results = vehicle_model(frame, conf=0.4, device=DEVICE, half=USE_HALF, verbose=False)
 
     for result in results:
         if result.boxes is None:
@@ -266,7 +272,6 @@ def anpr(frame, vehicle_model, plate_engine, feed):
                 continue
             vx1, vy1, vx2, vy2 = map(int, detection.xyxy[0])
             vehicle_box = (vx1, vy1, vx2, vy2)
-            # Use YOLO track_id for stable vehicle identity; fallback to position
             tid = None
             if detection.id is not None:
                 try:
@@ -285,34 +290,45 @@ def anpr(frame, vehicle_model, plate_engine, feed):
                 "color": "#f59e0b"
             })
 
-            try:
-                anpr_res = plate_engine.process(
-                    frame,
-                    vehicle_box,
-                    vehicle_id=vehicle_id,
-                    camera_id=feed,
-                    timestamp=time.strftime("%Y-%m-%d %H:%M:%S"),
-                    use_temporal_fusion=True,
-                )
-                plate = anpr_res.get("plate_number")
-                if plate:
-                    pb = anpr_res.get("plate_bbox") or vehicle_box
-                    px1, py1, px2, py2 = pb
-                    dets.append({
-                        "x1": round(px1 / w, 4),
-                        "y1": round(py1 / h, 4),
-                        "w": round((px2 - px1) / w, 4),
-                        "h": round((py2 - py1) / h, 4),
-                        "label": f"PLATE: {plate}",
-                        "type": "plate",
-                        "color": "#06b6d4"
-                    })
-                    event(feed, "PLATE_DETECTED", f"Plate detected: {plate}",
-                          anpr_res, plate_number=plate,
-                          confidence=anpr_res.get("confidence"),
-                          object_type="Vehicle")
-            except Exception:
-                pass
+            # High-performance plate detection: run OCR at intervals until high confidence achieved
+            cached = plate_cache.get(vehicle_id)
+            need_ocr = (cached is None or cached.get("confidence", 0) < 0.65) and (frame_idx % 4 == 0)
+
+            if need_ocr and plate_engine is not None:
+                try:
+                    anpr_res = plate_engine.process(
+                        frame,
+                        vehicle_box,
+                        vehicle_id=vehicle_id,
+                        camera_id=feed,
+                        timestamp=time.strftime("%Y-%m-%d %H:%M:%S"),
+                        use_temporal_fusion=True,
+                    )
+                    plate = anpr_res.get("plate_number")
+                    if plate:
+                        plate_cache[vehicle_id] = anpr_res
+                        event(feed, "PLATE_DETECTED", f"Plate detected: {plate}",
+                              anpr_res, plate_number=plate,
+                              confidence=anpr_res.get("confidence"),
+                              object_type="Vehicle")
+                except Exception:
+                    pass
+
+            active_plate = plate_cache.get(vehicle_id)
+            if active_plate and active_plate.get("plate_number"):
+                plate = active_plate["plate_number"]
+                pb = active_plate.get("plate_bbox") or vehicle_box
+                px1, py1, px2, py2 = pb
+                dets.append({
+                    "x1": round(px1 / w, 4),
+                    "y1": round(py1 / h, 4),
+                    "w": round((px2 - px1) / w, 4),
+                    "h": round((py2 - py1) / h, 4),
+                    "label": f"PLATE: {plate}",
+                    "type": "plate",
+                    "color": "#06b6d4"
+                })
+
     with detections_lock:
         latest_detections[feed] = dets
     return output
@@ -361,7 +377,7 @@ def suspicious(frame, model, tracker, feed):
     dets = []
 
     try:
-        results = model(frame, conf=0.22, classes=[0], verbose=False)[0]
+        results = model(frame, conf=0.22, classes=[0], device=DEVICE, half=USE_HALF, verbose=False)[0]
     except Exception:
         results = None
 
@@ -559,18 +575,25 @@ def worker(feed, source):
         tracker = None
         if feed == "virtual_fence":
             polygon_pts = [(90, 125), (250, 125), (250, 235), (90, 235)]
-            processor = VirtualFenceEngine(str(ROOT / "yolo11n.pt"), "polygon", polygon_pts, [0])
+            processor = VirtualFenceEngine(str(ROOT / "yolo11n.pt"), "polygon", polygon_pts, [0], device=DEVICE)
         elif feed == "vehicle_detection":
             processor = YOLO(str(ROOT / "yolo11n.pt"))
+            if USE_HALF:
+                processor.to(DEVICE)
         elif feed == "human_detection":
             processor = YOLO(str(ROOT / "yolo11n.pt"))
-            # Increased dist_thresh to 120px for 320px-wide video; max_lost=6 for smoother continuity
+            if USE_HALF:
+                processor.to(DEVICE)
             tracker = SurveillanceTracker(max_lost_frames=6, iou_thresh=0.2, dist_thresh=120)
         elif feed == "suspicious_activity":
             processor = YOLO(str(ROOT / "yolo11n.pt"))
+            if USE_HALF:
+                processor.to(DEVICE)
             tracker = SurveillanceTracker(max_lost_frames=6, iou_thresh=0.15, dist_thresh=120)
         else:
             processor = YOLO(str(ROOT / "yolo11n.pt"))
+            if USE_HALF:
+                processor.to(DEVICE)
             model_path = ANPR_ROOT / "anpr" / "models" / "plate_detector.pt"
             if ANPREngine is None or not model_path.exists():
                 raise RuntimeError(f"ANPR unavailable; missing model: {model_path}")
@@ -578,17 +601,26 @@ def worker(feed, source):
             plate_engine = ANPREngine(ANPRConfig(
                 plate_detector_weights=str(model_path),
                 ocr_engine="easyocr",
+                ocr_use_gpu=torch.cuda.is_available(),
             ))
 
         statuses[feed]["running"] = True
+        frame_idx = 0
+        plate_cache = {}
+        # Inference Cadence: Run neural network inference every 2nd frame (15 FPS AI)
+        # This keeps video streams running at smooth 30 FPS while cutting compute load and heat by 50%!
+        INFER_CADENCE = 2
 
         while not stop_event.is_set():
             loop_start = time.time()
+            frame_idx += 1
 
             ok, frame = capture.read()
             if not ok or frame is None:
                 # End of video — reset and loop back to start
                 capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                frame_idx = 0
+                plate_cache.clear()
                 if hasattr(processor, "reset"):
                     processor.reset()
                 if tracker is not None:
@@ -597,23 +629,28 @@ def worker(feed, source):
                     latest_detections[feed] = []
                 continue
 
-            if feed == "virtual_fence":
-                output = fence(frame, processor, feed)
-            elif feed == "vehicle_detection":
-                output = vehicles(frame, processor, feed)
-            elif feed == "human_detection":
-                output = humans(frame, processor, tracker, feed)
-            elif feed == "suspicious_activity":
-                output = suspicious(frame, processor, tracker, feed)
-            else:
-                output = anpr(frame, processor, plate_engine, feed)
+            should_infer = (frame_idx % INFER_CADENCE == 0)
 
-            ok, encoded = cv2.imencode(".jpg", output, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
+            if should_infer:
+                if feed == "virtual_fence":
+                    output = fence(frame, processor, feed)
+                elif feed == "vehicle_detection":
+                    output = vehicles(frame, processor, feed)
+                elif feed == "human_detection":
+                    output = humans(frame, processor, tracker, feed)
+                elif feed == "suspicious_activity":
+                    output = suspicious(frame, processor, tracker, feed)
+                else:
+                    output = anpr(frame, processor, plate_engine, feed, frame_idx=frame_idx, plate_cache=plate_cache)
+            else:
+                output = frame
+
+            ok, encoded = cv2.imencode(".jpg", output, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
             if ok:
                 with locks[feed]:
                     frames[feed] = encoded.tobytes()
 
-            # Pace to video FPS — sleep just enough to not over-run
+            # Dynamic pacing to video FPS — sleep just enough to maintain real-time speed
             elapsed = time.time() - loop_start
             sleep_time = frame_duration - elapsed
             if sleep_time > 0:
