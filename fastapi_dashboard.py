@@ -30,14 +30,7 @@ app = FastAPI(title="Drishti Monitoring MVP")
 if ASSETS_DIR.exists():
     app.mount("/assets", StaticFiles(directory=str(ASSETS_DIR)), name="assets")
 
-SOURCES = {
-    "virtual_fence": TEST_DIR / "virtual_fence.mp4",
-    "vehicle_detection": TEST_DIR / "vehicle_detection.mp4",
-    "human_detection": TEST_DIR / "human_deetection.mp4",
-    "anpr": TEST_DIR / "Automatic Number Plate Recognition (ANPR) _ Vehicle Number Plate Recognition (1).mp4",
-    "suspicious_activity": TEST_DIR / "suspicious_activity.mp4",
-    "facial_recognition": 0,
-}
+from config import SOURCES
 
 frames = {name: None for name in SOURCES}
 locks = {name: threading.Lock() for name in SOURCES}
