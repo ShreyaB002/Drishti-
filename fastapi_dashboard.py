@@ -144,15 +144,57 @@ def event(feed, event_type, message, details=None, cooldown=1.5,
         events.appendleft(item)
 
 
+def draw_surveillance_box(img, x1, y1, x2, y2, label, color_bgr, thickness=2, is_alert=False):
+    """Burn-in tactical surveillance bounding box with corner accents and label badge."""
+    h, w = img.shape[:2]
+    x1, y1 = max(0, int(x1)), max(0, int(y1))
+    x2, y2 = min(w - 1, int(x2)), min(h - 1, int(y2))
+    if x2 <= x1 or y2 <= y1:
+        return
+
+    # Alert highlight tint (semi-transparent crimson)
+    if is_alert:
+        sub = img[y1:y2, x1:x2]
+        if sub.size > 0:
+            tint = np.full_like(sub, (0, 0, 180), dtype=np.uint8)
+            img[y1:y2, x1:x2] = cv2.addWeighted(sub, 0.70, tint, 0.30, 0)
+
+    # Main rectangle
+    cv2.rectangle(img, (x1, y1), (x2, y2), color_bgr, thickness)
+
+    # Tactical corner brackets
+    c_len = max(5, min(14, (x2 - x1) // 5, (y2 - y1) // 5))
+    cv2.line(img, (x1, y1), (x1 + c_len, y1), color_bgr, thickness + 1)
+    cv2.line(img, (x1, y1), (x1, y1 + c_len), color_bgr, thickness + 1)
+    cv2.line(img, (x2, y1), (x2 - c_len, y1), color_bgr, thickness + 1)
+    cv2.line(img, (x2, y1), (x2, y1 + c_len), color_bgr, thickness + 1)
+    cv2.line(img, (x1, y2), (x1 + c_len, y2), color_bgr, thickness + 1)
+    cv2.line(img, (x1, y2), (x1, y2 - c_len), color_bgr, thickness + 1)
+    cv2.line(img, (x2, y2), (x2 - c_len, y2), color_bgr, thickness + 1)
+    cv2.line(img, (x2, y2), (x2, y2 - c_len), color_bgr, thickness + 1)
+
+    # Text label badge above box
+    if label:
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.38
+        font_thick = 1
+        (tw, th), _ = cv2.getTextSize(label, font, font_scale, font_thick)
+        by1 = max(0, y1 - th - 6)
+        by2 = y1
+        bx2 = min(w, x1 + tw + 6)
+        cv2.rectangle(img, (x1, by1), (bx2, by2), color_bgr, -1)
+        cv2.putText(img, label, (x1 + 3, y1 - 4), font, font_scale, (255, 255, 255), font_thick, cv2.LINE_AA)
+
+
 def box(frame, coords, color=(0, 255, 0), thickness=1):
     x1, y1, x2, y2 = map(int, coords)
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
 
 
 def vehicles(frame, model, tracker, feed):
-    output = frame.copy()
     h, w = frame.shape[:2]
     dets = []
+    draw_items = []
     try:
         results = model(frame, conf=0.50, device=DEVICE, half=USE_HALF, verbose=False)[0]
     except Exception:
@@ -185,14 +227,21 @@ def vehicles(frame, model, tracker, feed):
         vname = d.get("name", "Vehicle")
         conf = d.get("conf", 0.75)
         max_conf = max(max_conf, conf)
+        label_text = f"{vname} #{tid}"
         dets.append({
             "x1": round(x1 / w, 4),
             "y1": round(y1 / h, 4),
             "w": round((x2 - x1) / w, 4),
             "h": round((y2 - y1) / h, 4),
-            "label": f"{vname} #{tid}",
+            "label": label_text,
             "type": "vehicle",
             "color": "#f59e0b"
+        })
+        draw_items.append({
+            "box": (x1, y1, x2, y2),
+            "label": f"{vname} #{tid} ({int(conf*100)}%)",
+            "color": (15, 165, 245),  # Amber BGR
+            "is_alert": False
         })
 
     if tracked:
@@ -201,13 +250,13 @@ def vehicles(frame, model, tracker, feed):
 
     with detections_lock:
         latest_detections[feed] = dets
-    return output
+    return draw_items
 
 
 def humans(frame, model, tracker, feed):
-    output = frame.copy()
     h, w = frame.shape[:2]
     dets = []
+    draw_items = []
     try:
         results = model(frame, conf=0.22, classes=[0], device=DEVICE, half=USE_HALF, verbose=False)[0]
     except Exception:
@@ -218,7 +267,7 @@ def humans(frame, model, tracker, feed):
         for b in results.boxes:
             conf = float(b.conf[0])
             x1, y1, x2, y2 = map(int, b.xyxy[0])
-            # Min 18px height for 240p video (was 25px — too aggressive)
+            # Min 18px height for 240p video
             if (y2 - y1) >= 18:
                 raw.append({
                     "bbox": (x1, y1, x2, y2),
@@ -233,14 +282,21 @@ def humans(frame, model, tracker, feed):
         tid = d["track_id"]
         conf = d.get("conf", 0.8)
         max_conf = max(max_conf, conf)
+        label_text = f"Person #{tid}"
         dets.append({
             "x1": round(x1 / w, 4),
             "y1": round(y1 / h, 4),
             "w": round((x2 - x1) / w, 4),
             "h": round((y2 - y1) / h, 4),
-            "label": f"Person #{tid}",
+            "label": label_text,
             "type": "human",
             "color": "#10b981"
+        })
+        draw_items.append({
+            "box": (x1, y1, x2, y2),
+            "label": f"Person #{tid} ({int(conf*100)}%)",
+            "color": (50, 205, 50),  # Emerald Green BGR
+            "is_alert": False
         })
 
     if tracked:
@@ -249,13 +305,14 @@ def humans(frame, model, tracker, feed):
 
     with detections_lock:
         latest_detections[feed] = dets
-    return output
+    return draw_items
 
 
 def fence(frame, engine, feed):
-    output, alerts, detections = engine.process_frame(frame)
+    _, alerts, detections = engine.process_frame(frame)
     h, w = frame.shape[:2]
     dets = []
+    draw_items = []
     for alert in alerts:
         event(feed, "INTRUSION_DETECTED",
               f"Person crossed restricted zone (track #{alert['track_id']})",
@@ -265,7 +322,8 @@ def fence(frame, engine, feed):
     for d in detections:
         x1, y1, x2, y2 = d["bbox"]
         is_intruder = d["is_intruder"]
-        color = "#ef4444" if is_intruder else "#10b981"
+        color_hex = "#ef4444" if is_intruder else "#10b981"
+        color_bgr = (30, 30, 235) if is_intruder else (50, 205, 50)
         label = f"INTRUDER #{d['track_id']}" if is_intruder else f"Person #{d['track_id']}"
         dets.append({
             "x1": round(x1 / w, 4),
@@ -274,17 +332,23 @@ def fence(frame, engine, feed):
             "h": round((y2 - y1) / h, 4),
             "label": label,
             "type": "intruder" if is_intruder else "human",
-            "color": color
+            "color": color_hex
+        })
+        draw_items.append({
+            "box": (x1, y1, x2, y2),
+            "label": label,
+            "color": color_bgr,
+            "is_alert": is_intruder
         })
     with detections_lock:
         latest_detections[feed] = dets
-    return output
+    return draw_items
 
 
 def anpr(frame, vehicle_model, plate_engine, feed, frame_idx=0, plate_cache=None):
-    output = frame.copy()
     h, w = frame.shape[:2]
     dets = []
+    draw_items = []
     if plate_cache is None:
         plate_cache = {}
 
@@ -309,6 +373,14 @@ def anpr(frame, vehicle_model, plate_engine, feed, frame_idx=0, plate_cache=None
                 except Exception:
                     pass
             vehicle_id = f"{feed}_track_{tid}" if tid is not None else f"{feed}_{vx1}_{vy1}"
+            vlabel = f"{name.capitalize()} #{tid if tid is not None else ''}".strip()
+
+            draw_items.append({
+                "box": vehicle_box,
+                "label": vlabel,
+                "color": (15, 165, 245),
+                "is_alert": False
+            })
 
             dets.append({
                 "x1": round(vx1 / w, 4),
@@ -349,6 +421,13 @@ def anpr(frame, vehicle_model, plate_engine, feed, frame_idx=0, plate_cache=None
                 plate = active_plate["plate_number"]
                 pb = active_plate.get("plate_bbox") or vehicle_box
                 px1, py1, px2, py2 = pb
+                draw_items.append({
+                    "box": (px1, py1, px2, py2),
+                    "label": f"PLATE: {plate}",
+                    "color": (235, 180, 0),
+                    "is_alert": False,
+                    "hud_plate": plate
+                })
                 dets.append({
                     "x1": round(px1 / w, 4),
                     "y1": round(py1 / h, 4),
@@ -361,7 +440,7 @@ def anpr(frame, vehicle_model, plate_engine, feed, frame_idx=0, plate_cache=None
 
     with detections_lock:
         latest_detections[feed] = dets
-    return output
+    return draw_items
 
 
 AUTHORIZED_FACE_VECTORS = []
@@ -402,9 +481,9 @@ def init_face_recognition():
 
 
 def suspicious(frame, model, tracker, feed):
-    output = frame.copy()
     h, w = frame.shape[:2]
     dets = []
+    draw_items = []
 
     try:
         results = model(frame, conf=0.22, classes=[0], device=DEVICE, half=USE_HALF, verbose=False)[0]
@@ -416,7 +495,7 @@ def suspicious(frame, model, tracker, feed):
         for b in results.boxes:
             conf = float(b.conf[0])
             x1, y1, x2, y2 = map(int, b.xyxy[0])
-            # Min 20px height for 240p video (was 40px — too aggressive, missed most detections)
+            # Min 20px height for 240p video
             if (y2 - y1) >= 20:
                 raw.append({
                     "bbox": (x1, y1, x2, y2),
@@ -433,14 +512,21 @@ def suspicious(frame, model, tracker, feed):
         conf = d.get("conf", 0.75)
         max_conf = max(max_conf, conf)
         # In Cam 5, any nocturnal presence in this restricted stairwell is flagged as suspicious activity
+        label_text = f"SUSPICIOUS: Person #{tid}"
         dets.append({
             "x1": round(x1 / w, 4),
             "y1": round(y1 / h, 4),
             "w": round((x2 - x1) / w, 4),
             "h": round((y2 - y1) / h, 4),
-            "label": f"SUSPICIOUS: Person #{tid} ({int(conf * 100)}%)",
+            "label": f"{label_text} ({int(conf * 100)}%)",
             "type": "suspicious",
             "color": "#ef4444"
+        })
+        draw_items.append({
+            "box": (x1, y1, x2, y2),
+            "label": f"{label_text} ({int(conf * 100)}%)",
+            "color": (30, 30, 235),
+            "is_alert": True
         })
 
     if tracked:
@@ -449,20 +535,19 @@ def suspicious(frame, model, tracker, feed):
 
     with detections_lock:
         latest_detections[feed] = dets
-    return output
+    return draw_items
 
 
 def facial_rec(frame, detector, feed):
-    output = frame.copy()
     h, w = frame.shape[:2]
     dets = []
+    draw_items = []
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     faces = detector.detectMultiScale(gray, scaleFactor=1.15, minNeighbors=4, minSize=(50, 50))
 
     for (x, y, fw, fh) in faces:
         face_crop = cv2.resize(gray[y:y+fh, x:x+fw], (64, 64)).astype(np.float32)
         norm_crop = (face_crop - np.mean(face_crop)) / (np.std(face_crop) + 1e-6)
-        # Flatten and re-normalize to unit vector for proper cosine similarity
         flat_crop = norm_crop.flatten()
         flat_crop = flat_crop / (np.linalg.norm(flat_crop) + 1e-8)
         sim = 0.0
@@ -472,14 +557,18 @@ def facial_rec(frame, detector, feed):
 
         if sim >= 0.55:
             label = "Facial Recognition Successful"
-            color = "#10b981"
+            color_hex = "#10b981"
+            color_bgr = (50, 205, 50)
             det_type = "verified_face"
+            is_alert = False
             event(feed, "HUMAN_DETECTED", "Facial Recognition Successful: Authorized Face Verified",
                   {"status": "Verified"}, confidence=round(sim, 2), object_type="Person", cooldown=3.0)
         else:
             label = "Face Not Recognised"
-            color = "#ef4444"
+            color_hex = "#ef4444"
+            color_bgr = (30, 30, 235)
             det_type = "unrecognized_face"
+            is_alert = True
             event(feed, "SUSPICIOUS", "Security Alert: Face Not Recognised",
                   {"status": "Unrecognized"}, confidence=round(max(0.0, sim), 2), object_type="Person", cooldown=3.0)
 
@@ -490,12 +579,18 @@ def facial_rec(frame, detector, feed):
             "h": round(fh / h, 4),
             "label": label,
             "type": det_type,
-            "color": color
+            "color": color_hex
+        })
+        draw_items.append({
+            "box": (x, y, x + fw, y + fh),
+            "label": f"{label} ({int(sim * 100)}%)" if sim > 0 else label,
+            "color": color_bgr,
+            "is_alert": is_alert
         })
 
     with detections_lock:
         latest_detections[feed] = dets
-    return output
+    return draw_items
 
 
 def reset_tracker(processor):
@@ -549,7 +644,11 @@ def worker(feed, source):
                 if not ok or frame is None:
                     time.sleep(0.04)
                     continue
-                output = facial_rec(frame, detector, feed)
+                draw_items = facial_rec(frame, detector, feed)
+                output = frame.copy()
+                for item in draw_items:
+                    bx1, by1, bx2, by2 = item["box"]
+                    draw_surveillance_box(output, bx1, by1, bx2, by2, item["label"], item["color"], is_alert=item.get("is_alert", False))
                 ok, encoded = cv2.imencode(".jpg", output, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
                 if ok:
                     with locks[feed]:
@@ -574,10 +673,12 @@ def worker(feed, source):
             statuses[feed]["running"] = True
             while not stop_event.is_set():
                 frame = img.copy()
+                output = frame.copy()
                 if feed == "facial_recognition":
-                    output = facial_rec(frame, detector, feed)
-                else:
-                    output = frame
+                    draw_items = facial_rec(frame, detector, feed)
+                    for item in draw_items:
+                        bx1, by1, bx2, by2 = item["box"]
+                        draw_surveillance_box(output, bx1, by1, bx2, by2, item["label"], item["color"], is_alert=item.get("is_alert", False))
                 ok, encoded = cv2.imencode(".jpg", output, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
                 if ok:
                     with locks[feed]:
@@ -638,9 +739,9 @@ def worker(feed, source):
         statuses[feed]["running"] = True
         frame_idx = 0
         plate_cache = {}
-        # Inference Cadence: Run neural network inference every 2nd frame (15 FPS AI)
-        # This keeps video streams running at smooth 30 FPS while cutting compute load and heat by 50%!
         INFER_CADENCE = 2
+        feed_draw_items = []
+        fence_pts = np.array([(90, 125), (250, 125), (250, 235), (90, 235)], dtype=np.int32)
 
         while not stop_event.is_set():
             loop_start = time.time()
@@ -648,10 +749,10 @@ def worker(feed, source):
 
             ok, frame = capture.read()
             if not ok or frame is None:
-                # End of video — reset and loop back to start
                 capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 frame_idx = 0
                 plate_cache.clear()
+                feed_draw_items = []
                 if hasattr(processor, "reset"):
                     processor.reset()
                 if tracker is not None:
@@ -664,24 +765,56 @@ def worker(feed, source):
 
             if should_infer:
                 if feed == "virtual_fence":
-                    output = fence(frame, processor, feed)
+                    feed_draw_items = fence(frame, processor, feed)
                 elif feed == "vehicle_detection":
-                    output = vehicles(frame, processor, tracker, feed)
+                    feed_draw_items = vehicles(frame, processor, tracker, feed)
                 elif feed == "human_detection":
-                    output = humans(frame, processor, tracker, feed)
+                    feed_draw_items = humans(frame, processor, tracker, feed)
                 elif feed == "suspicious_activity":
-                    output = suspicious(frame, processor, tracker, feed)
+                    feed_draw_items = suspicious(frame, processor, tracker, feed)
                 else:
-                    output = anpr(frame, processor, plate_engine, feed, frame_idx=frame_idx, plate_cache=plate_cache)
-            else:
-                output = frame
+                    feed_draw_items = anpr(frame, processor, plate_engine, feed, frame_idx=frame_idx, plate_cache=plate_cache)
+
+            # Render overlay directly onto frame (Every single frame gets decorated for zero flicker!)
+            output = frame.copy()
+
+            # Virtual fence zone overlay
+            if feed == "virtual_fence":
+                poly_overlay = output.copy()
+                cv2.fillPoly(poly_overlay, [fence_pts], (0, 0, 160))
+                cv2.addWeighted(poly_overlay, 0.22, output, 0.78, 0, output)
+                cv2.polylines(output, [fence_pts], isClosed=True, color=(0, 0, 240), thickness=2)
+                cv2.putText(output, "RESTRICTED ZONE", (95, 142), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 0, 255), 1, cv2.LINE_AA)
+
+            # Draw all tracked boxes
+            for item in feed_draw_items:
+                bx1, by1, bx2, by2 = item["box"]
+                draw_surveillance_box(
+                    output, bx1, by1, bx2, by2,
+                    item["label"], item["color"],
+                    is_alert=item.get("is_alert", False)
+                )
+
+            # ANPR plate HUD banner on video
+            if feed == "anpr":
+                plate_item = next((it for it in feed_draw_items if it.get("hud_plate")), None)
+                if plate_item:
+                    ptext = plate_item["hud_plate"]
+                    cv2.rectangle(output, (8, 8), (220, 38), (15, 15, 15), -1)
+                    cv2.rectangle(output, (8, 8), (220, 38), (235, 180, 0), 2)
+                    cv2.putText(output, f"PLATE: {ptext}", (14, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
+
+            # Suspicious alert banner on video
+            if feed == "suspicious_activity" and any(it.get("is_alert") for it in feed_draw_items):
+                cv2.rectangle(output, (8, 8), (260, 36), (20, 20, 180), -1)
+                cv2.putText(output, "SECURITY ALERT: RESTRICTED AREA", (14, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (255, 255, 255), 1, cv2.LINE_AA)
 
             ok, encoded = cv2.imencode(".jpg", output, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
             if ok:
                 with locks[feed]:
                     frames[feed] = encoded.tobytes()
 
-            # Dynamic pacing to video FPS — sleep just enough to maintain real-time speed
+            # Dynamic pacing to video FPS
             elapsed = time.time() - loop_start
             sleep_time = frame_duration - elapsed
             if sleep_time > 0:
@@ -1749,34 +1882,10 @@ HTML = """
     }
 
     function renderFeedDetections(feedKey, detections) {
+      // OpenCV renders crisp surveillance bounding boxes, IDs, and alert badges directly onto the video stream.
+      // Keeping this container clean ensures pixel-perfect native video display without DOM overlay lag.
       const container = document.getElementById('bbox-' + feedKey);
-      if (!container) return;
-      if (!detections || detections.length === 0) {
-        container.innerHTML = '';
-        return;
-      }
-
-      // Extract the best (first) plate reading for the banner
-      const plateDet = detections.find(d => d.type === 'plate');
-
-      let html = detections.map(d => {
-        const isPlate = d.type === 'plate';
-        const borderPx = isPlate ? '2.5px' : '1.5px';
-        const rawLabel = d.label || '';
-        const label = isPlate ? escapeHtml(rawLabel.replace(/^PLATE:\s*/i, '')) : escapeHtml(rawLabel);
-        return `
-        <div class="bbox-tag" style="left:${d.x1 * 100}%; top:${d.y1 * 100}%; width:${d.w * 100}%; height:${d.h * 100}%; border-color:${d.color}; border-width:${borderPx};">
-          <span class="bbox-label" style="background:${d.color}; ${isPlate ? 'font-size:13px; padding:2px 7px; letter-spacing:0.05em;' : ''}">${label}</span>
-        </div>`;
-      }).join('');
-
-      // Big plate banner in top-left corner
-      if (plateDet) {
-        const plateNum = escapeHtml((plateDet.label || '').replace(/^PLATE:\s*/i, ''));
-        html += `<div class="plate-banner">${plateNum}</div>`;
-      }
-
-      container.innerHTML = html;
+      if (container) container.innerHTML = '';
     }
 
     let lastRenderedEventKey = '';
@@ -1909,7 +2018,7 @@ HTML = """
     }
 
     refreshStatus();
-    setInterval(refreshStatus, 60);
+    setInterval(refreshStatus, 1000);
   </script>
 </body>
 </html>
