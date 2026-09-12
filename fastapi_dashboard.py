@@ -181,7 +181,7 @@ def humans(frame, model, tracker, feed):
     h, w = frame.shape[:2]
     dets = []
     try:
-        results = model(frame, conf=0.25, classes=[0], verbose=False)[0]
+        results = model(frame, conf=0.22, classes=[0], verbose=False)[0]
     except Exception:
         results = None
 
@@ -190,7 +190,8 @@ def humans(frame, model, tracker, feed):
         for b in results.boxes:
             conf = float(b.conf[0])
             x1, y1, x2, y2 = map(int, b.xyxy[0])
-            if (y2 - y1) >= 25:  # Filter noise / tiny artifacts
+            # Min 18px height for 240p video (was 25px — too aggressive)
+            if (y2 - y1) >= 18:
                 raw.append({
                     "bbox": (x1, y1, x2, y2),
                     "conf": conf
@@ -348,11 +349,17 @@ def init_face_recognition():
             for (x, y, w, h) in faces:
                 face_crop = cv2.resize(gray[y:y+h, x:x+w], (64, 64)).astype(np.float32)
                 vec = (face_crop - np.mean(face_crop)) / (np.std(face_crop) + 1e-6)
-                AUTHORIZED_FACE_VECTORS.append(vec)
+                # Flatten and normalize to unit vector for cosine similarity
+                flat = vec.flatten()
+                flat = flat / (np.linalg.norm(flat) + 1e-8)
+                AUTHORIZED_FACE_VECTORS.append(flat)
         else:
+            # No face detected — use full image as reference (resize to 64x64)
             face_crop = cv2.resize(gray, (64, 64)).astype(np.float32)
             vec = (face_crop - np.mean(face_crop)) / (np.std(face_crop) + 1e-6)
-            AUTHORIZED_FACE_VECTORS.append(vec)
+            flat = vec.flatten()
+            flat = flat / (np.linalg.norm(flat) + 1e-8)
+            AUTHORIZED_FACE_VECTORS.append(flat)
 
 
 def suspicious(frame, model, tracker, feed):
@@ -361,7 +368,7 @@ def suspicious(frame, model, tracker, feed):
     dets = []
 
     try:
-        results = model(frame, conf=0.28, classes=[0], verbose=False)[0]
+        results = model(frame, conf=0.22, classes=[0], verbose=False)[0]
     except Exception:
         results = None
 
@@ -370,7 +377,8 @@ def suspicious(frame, model, tracker, feed):
         for b in results.boxes:
             conf = float(b.conf[0])
             x1, y1, x2, y2 = map(int, b.xyxy[0])
-            if (y2 - y1) >= 40:
+            # Min 20px height for 240p video (was 40px — too aggressive, missed most detections)
+            if (y2 - y1) >= 20:
                 raw.append({
                     "bbox": (x1, y1, x2, y2),
                     "conf": conf,
@@ -415,9 +423,12 @@ def facial_rec(frame, detector, feed):
     for (x, y, fw, fh) in faces:
         face_crop = cv2.resize(gray[y:y+fh, x:x+fw], (64, 64)).astype(np.float32)
         norm_crop = (face_crop - np.mean(face_crop)) / (np.std(face_crop) + 1e-6)
+        # Flatten and re-normalize to unit vector for proper cosine similarity
+        flat_crop = norm_crop.flatten()
+        flat_crop = flat_crop / (np.linalg.norm(flat_crop) + 1e-8)
         sim = 0.0
         if AUTHORIZED_FACE_VECTORS:
-            sims = [float(np.mean(norm_crop * v)) for v in AUTHORIZED_FACE_VECTORS]
+            sims = [float(np.dot(flat_crop, v)) for v in AUTHORIZED_FACE_VECTORS]
             sim = max(sims)
 
         if sim >= 0.55:
@@ -560,10 +571,11 @@ def worker(feed, source):
             processor = YOLO(str(ROOT / "yolo11n.pt"))
         elif feed == "human_detection":
             processor = YOLO(str(ROOT / "yolo11n.pt"))
-            tracker = SurveillanceTracker(max_lost_frames=4, iou_thresh=0.2, dist_thresh=80)
+            # Increased dist_thresh to 120px for 320px-wide video; max_lost=6 for smoother continuity
+            tracker = SurveillanceTracker(max_lost_frames=6, iou_thresh=0.2, dist_thresh=120)
         elif feed == "suspicious_activity":
             processor = YOLO(str(ROOT / "yolo11n.pt"))
-            tracker = SurveillanceTracker(max_lost_frames=4, iou_thresh=0.15, dist_thresh=90)
+            tracker = SurveillanceTracker(max_lost_frames=6, iou_thresh=0.15, dist_thresh=120)
         else:
             processor = YOLO(str(ROOT / "yolo11n.pt"))
             model_path = ANPR_ROOT / "anpr" / "models" / "plate_detector.pt"
@@ -576,32 +588,14 @@ def worker(feed, source):
             ))
 
         statuses[feed]["running"] = True
-        start_wall_time = time.time()
 
         while not stop_event.is_set():
-            now = time.time()
-            elapsed = now - start_wall_time
-            target_frame = int(elapsed * fps)
-
-            if total_frames > 0 and target_frame >= total_frames:
-                capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                start_wall_time = time.time()
-                target_frame = 0
-                if hasattr(processor, "reset"):
-                    processor.reset()
-                if tracker is not None:
-                    tracker.reset()
-                with detections_lock:
-                    latest_detections[feed] = []
-
-            current_pos = int(capture.get(cv2.CAP_PROP_POS_FRAMES))
-            if target_frame > current_pos + 1:
-                capture.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+            loop_start = time.time()
 
             ok, frame = capture.read()
-            if not ok:
+            if not ok or frame is None:
+                # End of video — reset and loop back to start
                 capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                start_wall_time = time.time()
                 if hasattr(processor, "reset"):
                     processor.reset()
                 if tracker is not None:
@@ -621,19 +615,23 @@ def worker(feed, source):
             else:
                 output = anpr(frame, processor, plate_engine, feed)
 
-            ok, encoded = cv2.imencode(".jpg", output, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+            ok, encoded = cv2.imencode(".jpg", output, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
             if ok:
                 with locks[feed]:
                     frames[feed] = encoded.tobytes()
 
-            proc_duration = time.time() - now
-            if proc_duration < frame_duration:
-                time.sleep(frame_duration - proc_duration)
+            # Pace to video FPS — sleep just enough to not over-run
+            elapsed = time.time() - loop_start
+            sleep_time = frame_duration - elapsed
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
     except Exception as exc:
         statuses[feed]["error"] = str(exc)
         event(feed, "ERROR", str(exc), cooldown=0)
     finally:
         capture.release()
+
 
 
 def stream(feed):

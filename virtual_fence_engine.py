@@ -12,8 +12,9 @@ class SurveillanceTracker:
     """
     Lightweight, deterministic spatial tracker for CCTV surveillance.
     Ensures persistent, low-integer IDs (#1, #2...) that never jump or explode.
+    Uses IoU + centroid distance dual-metric matching with NMS pre-filtering.
     """
-    def __init__(self, max_lost_frames=4, iou_thresh=0.2, dist_thresh=80):
+    def __init__(self, max_lost_frames=6, iou_thresh=0.2, dist_thresh=120):
         self.max_lost = max_lost_frames
         self.iou_thresh = iou_thresh
         self.dist_thresh = dist_thresh
@@ -40,7 +41,11 @@ class SurveillanceTracker:
         return ((cAx - cBx)**2 + (cAy - cBy)**2)**0.5
 
     @staticmethod
-    def _nms(candidates, iou_thresh=0.35):
+    def _nms(candidates, iou_thresh=0.40):
+        """
+        Non-maximum suppression: removes duplicate overlapping boxes from YOLO on the same person.
+        iou_thresh=0.40 collapses body+torso sub-detections without merging distinct people.
+        """
         if not candidates:
             return []
         sorted_dets = sorted(candidates, key=lambda x: x.get("conf", 0.0), reverse=True)
@@ -56,12 +61,17 @@ class SurveillanceTracker:
         return keep
 
     def update(self, detected_boxes):
-        # Apply NMS to eliminate overlapping sub-boxes on the same person
-        clean_boxes = self._nms(detected_boxes, 0.35)
+        """
+        Match detections to existing tracks using IoU + centroid distance.
+        Returns only actively matched detections (no ghost boxes from lost tracks).
+        """
+        # NMS to remove duplicate overlapping sub-boxes on the same person
+        clean_boxes = self._nms(detected_boxes, 0.40)
         matched = []
         unmatched_dets = list(range(len(clean_boxes)))
         unmatched_tracks = list(self.tracks.keys())
 
+        # Match existing tracks to detections
         for tid in list(unmatched_tracks):
             t_box = self.tracks[tid]["bbox"]
             best_det_idx = None
@@ -71,9 +81,17 @@ class SurveillanceTracker:
                 d_box = clean_boxes[d_idx]["bbox"]
                 iou = self._iou(t_box, d_box)
                 dist = self._dist(t_box, d_box)
-                score = iou if iou >= self.iou_thresh else (1.0 / (1.0 + dist) if dist <= self.dist_thresh else 0.0)
 
-                if score > best_score and score > 0.15:
+                # Primary: IoU matching. Fallback: distance-based (for fast movement)
+                if iou >= self.iou_thresh:
+                    score = iou
+                elif dist <= self.dist_thresh:
+                    # distance score: max ~0.5 at dist=0, ~0.009 at dist=120
+                    score = 1.0 / (1.0 + dist * 0.1)
+                else:
+                    score = 0.0
+
+                if score > best_score and score > 0.005:
                     best_score = score
                     best_det_idx = d_idx
 
@@ -85,6 +103,7 @@ class SurveillanceTracker:
                 unmatched_dets.remove(best_det_idx)
                 unmatched_tracks.remove(tid)
 
+        # New detections get smallest available positive integer IDs
         for d_idx in unmatched_dets:
             d = dict(clean_boxes[d_idx])
             used_ids = set(self.tracks.keys())
@@ -96,11 +115,13 @@ class SurveillanceTracker:
             self.tracks[tid] = {"bbox": d["bbox"], "lost": 0, "data": d}
             matched.append(d)
 
+        # Age lost tracks, delete if exceeded max_lost
         for tid in list(unmatched_tracks):
             self.tracks[tid]["lost"] += 1
             if self.tracks[tid]["lost"] > self.max_lost:
                 del self.tracks[tid]
 
+        # Return ONLY actively matched detections (no ghost boxes)
         return matched
 
 
@@ -127,7 +148,11 @@ class VirtualFenceEngine:
 
         self.target_classes = target_classes if target_classes is not None else [0]
         self.tracked_objects = {}
-        self.tracker = SurveillanceTracker(max_lost_frames=4, iou_thresh=0.2, dist_thresh=80)
+        # Increased dist_thresh from 80->120 for 320px-wide video to handle fast movers
+        self.tracker = SurveillanceTracker(max_lost_frames=6, iou_thresh=0.2, dist_thresh=120)
+        # Track how many consecutive frames each track has been inside the zone
+        # (avoids firing on first-frame false-positives)
+        self._zone_counter = {}
         
     def _check_line_intersect(self, p1, p2, p3, p4):
         def ccw(A, B, C):
@@ -169,9 +194,9 @@ class VirtualFenceEngine:
         alerts = []
         current_detections = []
         
-        # 1. Detect target objects with confidence threshold
+        # 1. Detect with lower confidence to catch smaller/partial persons in 320x240
         try:
-            results = self.model(frame, classes=self.target_classes, conf=0.40, verbose=False)[0]
+            results = self.model(frame, classes=self.target_classes, conf=0.30, verbose=False)[0]
         except Exception:
             results = None
 
@@ -179,18 +204,19 @@ class VirtualFenceEngine:
         if results is not None and results.boxes is not None:
             for b in results.boxes:
                 x1, y1, x2, y2 = map(int, b.xyxy[0])
-                # Filter out tiny noise (e.g. wheels/pedals misdetected as persons)
-                if (y2 - y1) >= 35:
+                # Min height 20px for 240p video (was 35px, was filtering too many real people)
+                if (y2 - y1) >= 20:
                     raw_candidates.append({
                         "bbox": (x1, y1, x2, y2),
                         "conf": float(b.conf[0]),
                         "class_id": int(b.cls[0])
                     })
 
-        # 2. Track with stable, low-number persistent IDs (#1, #2...)
+        # 2. Track
         tracked = self.tracker.update(raw_candidates)
 
         # 3. Evaluate Intrusion Logic
+        active_tids = set()
         for d in tracked:
             x1, y1, x2, y2 = d["bbox"]
             track_id = d["track_id"]
@@ -198,6 +224,7 @@ class VirtualFenceEngine:
             conf = d.get("conf", 0.8)
             curr_pos = (int((x1 + x2) / 2), y2)
             is_intruder = False
+            active_tids.add(track_id)
 
             if self.fence_type == "line":
                 if track_id in self.tracked_objects:
@@ -210,8 +237,14 @@ class VirtualFenceEngine:
                     ):
                         is_intruder = True
             elif self.fence_type == "polygon":
-                if self._check_polygon_inside(curr_pos):
-                    is_intruder = True
+                in_zone = self._check_polygon_inside(curr_pos)
+                if in_zone:
+                    # Require 2 consecutive frames inside zone to avoid single-frame false positives
+                    self._zone_counter[track_id] = self._zone_counter.get(track_id, 0) + 1
+                    if self._zone_counter[track_id] >= 2:
+                        is_intruder = True
+                else:
+                    self._zone_counter[track_id] = 0
 
             if is_intruder:
                 alerts.append({
@@ -232,11 +265,18 @@ class VirtualFenceEngine:
 
             self.tracked_objects[track_id] = curr_pos
 
+        # Clean up zone counters for tracks that are no longer active
+        for tid in list(self._zone_counter.keys()):
+            if tid not in active_tids:
+                del self._zone_counter[tid]
+
         return frame, alerts, current_detections
 
     def reset(self):
         self.tracked_objects.clear()
         self.tracker.reset()
+        self._zone_counter.clear()
+
 
 def select_fence_points(frame):
     """Let the user click two points on a frame to define a line fence."""
@@ -269,68 +309,10 @@ def select_fence_points(frame):
             cv2.line(display, points[0], points[1], (255, 0, 0), 2)
 
         cv2.imshow(window_name, display)
-        key = cv2.waitKey(20) & 0xFF
+        key = cv2.waitKey(1) & 0xFF
         if key == 27:
-            cv2.destroyWindow(window_name)
-            raise RuntimeError("Fence selection cancelled")
+            points.clear()
+            break
 
     cv2.destroyWindow(window_name)
-    return points
-
-
-# ==============================================================================
-# USAGE EXAMPLE (Can be run directly to test via webcam or a dummy feed)
-# ==============================================================================
-if __name__ == "__main__":
-    print("Starting Virtual Fence Engine Demo...")
-
-    # Open Webcam (0) or specify a video file e.g., 'border_feed.mp4'
-    cap = cv2.VideoCapture(0)
-    
-    if not cap.isOpened():
-        print("Error: Could not open video feed or webcam.")
-        exit()
-
-    ret, first_frame = cap.read()
-    if not ret:
-        print("Error: Could not read the first video frame.")
-        cap.release()
-        exit()
-
-    try:
-        fence_points = select_fence_points(first_frame)
-    except RuntimeError as error:
-        print(error)
-        cap.release()
-        cv2.destroyAllWindows()
-        exit()
-
-    engine = VirtualFenceEngine(
-        model_path="yolo11n.pt", 
-        fence_type="line",
-        fence_coords=fence_points,
-        target_classes=[0],  # 0 = Person
-    )
-
-    print("Fence selected. Engine running! Press 'q' to quit.")
-    
-    while True:
-        ret, current_frame = cap.read()
-        if not ret:
-            break
-            
-        annotated_frame, frame_alerts = engine.process_frame(current_frame)
-        
-        # If alerts were detected, handle them (Send API request, play sound, write to DB)
-        if frame_alerts:
-            for alert in frame_alerts:
-                print(f"[ALERT] Intrusion! Details: {alert}")
-        
-        # Display the output for the demo
-        cv2.imshow("Intelligent Border Surveillance", annotated_frame)
-        
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-
-    cap.release()
-    cv2.destroyAllWindows()
+    return points if len(points) == 2 else None
