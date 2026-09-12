@@ -20,6 +20,16 @@ print(f"[Drishti Engine] Active Compute Device: {DEVICE} (FP16 Half-Precision: {
 ROOT = Path(__file__).resolve().parent
 TEST_DIR = ROOT / "test"
 ASSETS_DIR = ROOT / "assets"
+
+FAVICON_DATA_URI = ""
+_fav_file = ASSETS_DIR / "favion.png"
+if _fav_file.exists():
+    try:
+        _b64 = base64.b64encode(_fav_file.read_bytes()).decode("ascii")
+        FAVICON_DATA_URI = f"data:image/png;base64,{_b64}"
+    except Exception:
+        pass
+
 ANPR_ROOT = ROOT / "anpr_engine"
 sys.path.insert(0, str(ANPR_ROOT))
 
@@ -139,36 +149,56 @@ def box(frame, coords, color=(0, 255, 0), thickness=1):
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
 
 
-def vehicles(frame, model, feed):
+def vehicles(frame, model, tracker, feed):
     output = frame.copy()
     h, w = frame.shape[:2]
     dets = []
-    count = 0
-    max_conf = 0.0
-    for result in model(frame, conf=0.4, device=DEVICE, half=USE_HALF, verbose=False):
-        if result.boxes is None:
-            continue
-        for detection in result.boxes:
-            name = result.names[int(detection.cls[0])]
+    try:
+        results = model(frame, conf=0.50, device=DEVICE, half=USE_HALF, verbose=False)[0]
+    except Exception:
+        results = None
+
+    raw = []
+    if results is not None and results.boxes is not None:
+        for b in results.boxes:
+            name = results.names[int(b.cls[0])]
             if name.lower() not in {"car", "truck", "bus", "motorcycle"}:
                 continue
-            count += 1
-            conf = float(detection.conf[0])
-            max_conf = max(max_conf, conf)
-            x1, y1, x2, y2 = map(int, detection.xyxy[0])
-            cv2.rectangle(output, (x1, y1), (x2, y2), (235, 140, 50), 1)
-            dets.append({
-                "x1": round(x1 / w, 4),
-                "y1": round(y1 / h, 4),
-                "w": round((x2 - x1) / w, 4),
-                "h": round((y2 - y1) / h, 4),
-                "label": f"{name} {conf:.2f}",
-                "type": "vehicle",
-                "color": "#f59e0b"
+            conf = float(b.conf[0])
+            x1, y1, x2, y2 = map(int, b.xyxy[0])
+            bw, bh = x2 - x1, y2 - y1
+            # Filter out road lane markings, stripes, and tiny artifacts
+            if bw < 18 or bh < 14 or (bh / bw) < 0.30:
+                continue
+            raw.append({
+                "bbox": (x1, y1, x2, y2),
+                "conf": conf,
+                "name": name.capitalize()
             })
-    if count:
-        event(feed, "VEHICLE_DETECTED", f"{count} vehicle(s) detected",
-              {"count": count}, confidence=max_conf, object_type="Vehicle")
+
+    tracked = tracker.update(raw) if tracker is not None else []
+    max_conf = 0.0
+
+    for d in tracked:
+        x1, y1, x2, y2 = d["bbox"]
+        tid = d["track_id"]
+        vname = d.get("name", "Vehicle")
+        conf = d.get("conf", 0.75)
+        max_conf = max(max_conf, conf)
+        dets.append({
+            "x1": round(x1 / w, 4),
+            "y1": round(y1 / h, 4),
+            "w": round((x2 - x1) / w, 4),
+            "h": round((y2 - y1) / h, 4),
+            "label": f"{vname} #{tid}",
+            "type": "vehicle",
+            "color": "#f59e0b"
+        })
+
+    if tracked:
+        event(feed, "VEHICLE_DETECTED", f"{len(tracked)} vehicle(s) detected",
+              {"count": len(tracked)}, confidence=max_conf, object_type="Vehicle")
+
     with detections_lock:
         latest_detections[feed] = dets
     return output
@@ -580,6 +610,7 @@ def worker(feed, source):
             processor = YOLO(str(ROOT / "yolo11n.pt"))
             if USE_HALF:
                 processor.to(DEVICE)
+            tracker = SurveillanceTracker(max_lost_frames=4, iou_thresh=0.25, dist_thresh=100)
         elif feed == "human_detection":
             processor = YOLO(str(ROOT / "yolo11n.pt"))
             if USE_HALF:
@@ -635,7 +666,7 @@ def worker(feed, source):
                 if feed == "virtual_fence":
                     output = fence(frame, processor, feed)
                 elif feed == "vehicle_detection":
-                    output = vehicles(frame, processor, feed)
+                    output = vehicles(frame, processor, tracker, feed)
                 elif feed == "human_detection":
                     output = humans(frame, processor, tracker, feed)
                 elif feed == "suspicious_activity":
@@ -687,14 +718,15 @@ def stop():
 
 @app.get("/", response_class=HTMLResponse)
 def home():
-    return HTMLResponse(HTML)
+    rendered = HTML.replace("{{FAVICON_URL}}", FAVICON_DATA_URI or "/assets/favion.png")
+    return HTMLResponse(rendered)
 
 
 @app.get("/favicon.ico", include_in_schema=False)
 def favicon():
     fav_path = ASSETS_DIR / "favion.png"
     if fav_path.exists():
-        return FileResponse(fav_path)
+        return FileResponse(fav_path, media_type="image/png")
     return HTMLResponse("", status_code=404)
 
 
@@ -760,8 +792,8 @@ HTML = """
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Drishti · Intelligent Border Video Analytics Platform</title>
-  <link rel="icon" type="image/png" href="/assets/favion.png">
-  <link rel="shortcut icon" type="image/png" href="/assets/favion.png">
+  <link rel="icon" type="image/png" href="{{FAVICON_URL}}">
+  <link rel="shortcut icon" type="image/png" href="{{FAVICON_URL}}">
   <style>
     :root {
       --bg: #f8fafc;
@@ -1394,12 +1426,22 @@ HTML = """
       position: relative;
       padding: 0;
     }
-    .modal-body img {
+    .modal-feed-wrapper {
+      position: relative;
       width: 100%;
       height: 100%;
       max-width: 100%;
       max-height: 100%;
-      object-fit: cover;
+      aspect-ratio: 16/9;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .modal-feed-wrapper img {
+      width: 100%;
+      height: 100%;
+      object-fit: fill;
+      display: block;
     }
 
     @media (max-width: 1100px) {
@@ -1555,9 +1597,11 @@ HTML = """
         <button class="close-btn" onclick="closeEnlarged()">&times;</button>
       </div>
       <div class="modal-body" id="modalBody">
-        <img id="enlargedImg" src="" alt="Enlarged Feed">
-        <div id="modalFenceLayer"></div>
-        <div class="bbox-layer" id="bbox-modal"></div>
+        <div class="modal-feed-wrapper" id="modalFeedWrapper">
+          <img id="enlargedImg" src="" alt="Enlarged Feed">
+          <div id="modalFenceLayer"></div>
+          <div class="bbox-layer" id="bbox-modal"></div>
+        </div>
       </div>
     </div>
   </div>
@@ -1638,10 +1682,27 @@ HTML = """
       drawerOverlay.classList.remove('active');
     }
 
+    let lastReceivedDetections = {};
+
     function openEnlarged(feedKey, title) {
       activeEnlargedKey = feedKey;
       modalTitle.textContent = title;
+
+      // Ensure 16:9 for ANPR, 4:3 for virtual_fence, human, suspicious
+      const wrapper = document.getElementById('modalFeedWrapper');
+      if (wrapper) {
+        wrapper.style.aspectRatio = (feedKey === 'anpr') ? '16/9' : '4/3';
+      }
+
+      // Temporarily pause card image to stay strictly within browser HTTP/1.1 connection limit
+      const cardImg = document.querySelector('#card-' + feedKey + ' img');
+      if (cardImg) {
+        cardImg.dataset.activeSrc = cardImg.src;
+        cardImg.src = '';
+      }
+
       enlargedImg.src = '/feed/' + feedKey;
+
       if (feedKey === 'virtual_fence') {
         modalFenceLayer.innerHTML = `
           <svg class="fence-svg" viewBox="0 0 100 100" preserveAspectRatio="none">
@@ -1653,12 +1714,23 @@ HTML = """
         modalFenceLayer.innerHTML = '';
       }
       modalOverlay.classList.add('active');
+
+      // Immediately render current active detections without waiting for next poll
+      if (lastReceivedDetections && lastReceivedDetections[feedKey]) {
+        renderFeedDetections('modal', lastReceivedDetections[feedKey]);
+      }
     }
 
     function closeEnlarged(e) {
       if (!e || e.target === modalOverlay || e.target.classList.contains('close-btn')) {
         modalOverlay.classList.remove('active');
         enlargedImg.src = '';
+        if (activeEnlargedKey) {
+          const cardImg = document.querySelector('#card-' + activeEnlargedKey + ' img');
+          if (cardImg && cardImg.dataset.activeSrc) {
+            cardImg.src = cardImg.dataset.activeSrc;
+          }
+        }
         activeEnlargedKey = null;
         modalFenceLayer.innerHTML = '';
         document.getElementById('bbox-modal').innerHTML = '';
@@ -1673,7 +1745,7 @@ HTML = """
     });
 
     function escapeHtml(str) {
-      return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+      return String(str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
     }
 
     function renderFeedDetections(feedKey, detections) {
@@ -1690,7 +1762,8 @@ HTML = """
       let html = detections.map(d => {
         const isPlate = d.type === 'plate';
         const borderPx = isPlate ? '2.5px' : '1.5px';
-        const label = isPlate ? escapeHtml(d.label.replace(/^PLATE:\s*/i, '')) : escapeHtml(d.label);
+        const rawLabel = d.label || '';
+        const label = isPlate ? escapeHtml(rawLabel.replace(/^PLATE:\s*/i, '')) : escapeHtml(rawLabel);
         return `
         <div class="bbox-tag" style="left:${d.x1 * 100}%; top:${d.y1 * 100}%; width:${d.w * 100}%; height:${d.h * 100}%; border-color:${d.color}; border-width:${borderPx};">
           <span class="bbox-label" style="background:${d.color}; ${isPlate ? 'font-size:13px; padding:2px 7px; letter-spacing:0.05em;' : ''}">${label}</span>
@@ -1699,7 +1772,7 @@ HTML = """
 
       // Big plate banner in top-left corner
       if (plateDet) {
-        const plateNum = escapeHtml(plateDet.label.replace(/^PLATE:\s*/i, ''));
+        const plateNum = escapeHtml((plateDet.label || '').replace(/^PLATE:\s*/i, ''));
         html += `<div class="plate-banner">${plateNum}</div>`;
       }
 
@@ -1823,6 +1896,7 @@ HTML = """
         }
 
         const detections = data.detections || {};
+        lastReceivedDetections = detections;
         for (const [feedKey, detList] of Object.entries(detections)) {
           renderFeedDetections(feedKey, detList);
           if (activeEnlargedKey === feedKey) {
