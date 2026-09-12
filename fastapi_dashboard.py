@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import csv
 import sys
@@ -8,7 +9,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from ultralytics import YOLO
@@ -107,25 +108,45 @@ EVENT_OBJECT = {
 }
 
 
-def get_snapshot(feed):
-    """Capture a 192×108 JPEG thumbnail of the current frame as a base64 string."""
-    with locks[feed]:
-        data = frames[feed]
-    if data is None:
-        return None
+def get_snapshot(feed, frame=None, draw_items=None, fence_pts=None):
+    """Capture a crisp 240x135 JPEG thumbnail of the current frame with bounding boxes as a base64 string."""
     try:
-        img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+        if frame is not None:
+            img = frame.copy()
+            if fence_pts is not None:
+                poly_overlay = img.copy()
+                cv2.fillPoly(poly_overlay, [fence_pts], (0, 0, 160))
+                cv2.addWeighted(poly_overlay, 0.22, img, 0.78, 0, img)
+                cv2.polylines(img, [fence_pts], isClosed=True, color=(0, 0, 240), thickness=2)
+            if draw_items:
+                for item in draw_items:
+                    bx1, by1, bx2, by2 = item["box"]
+                    draw_surveillance_box(img, bx1, by1, bx2, by2, item["label"], item["color"], is_alert=item.get("is_alert", False))
+        else:
+            with locks[feed]:
+                data = frames[feed]
+            if data is None:
+                return None
+            img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+
+        if img is None or img.size == 0:
+            return None
+
         h, w = img.shape[:2]
-        scale = min(192 / w, 108 / h)
-        thumb = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
-        _, enc = cv2.imencode(".jpg", thumb, [cv2.IMWRITE_JPEG_QUALITY, 65])
-        return base64.b64encode(enc.tobytes()).decode()
+        scale = min(240 / w, 135 / h)
+        tw, th = max(1, int(w * scale)), max(1, int(h * scale))
+        thumb = cv2.resize(img, (tw, th), interpolation=cv2.INTER_AREA)
+        ok, enc = cv2.imencode(".jpg", thumb, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
+        if ok:
+            return base64.b64encode(enc.tobytes()).decode("ascii")
     except Exception:
-        return None
+        pass
+    return None
 
 
 def event(feed, event_type, message, details=None, cooldown=1.5,
-          object_type=None, confidence=None, plate_number=None):
+          object_type=None, confidence=None, plate_number=None,
+          frame=None, draw_items=None, fence_pts=None):
     cam_label = CAM_NAMES.get(feed, feed)
     key = (cam_label, event_type)        # key no longer includes message so edits
     now = time.time()                    # don't leak duplicate-suppression state
@@ -136,7 +157,7 @@ def event(feed, event_type, message, details=None, cooldown=1.5,
     obj = object_type or EVENT_OBJECT.get(event_type)
     severity = EVENT_SEVERITY.get(event_type, "Low")
     display = EVENT_DISPLAY.get(event_type, event_type)
-    snapshot = get_snapshot(feed)
+    snapshot = get_snapshot(feed, frame=frame, draw_items=draw_items, fence_pts=fence_pts)
 
     global EVENT_COUNTER
     with status_lock:
@@ -291,7 +312,8 @@ def vehicles(frame, model, tracker, feed):
 
     if tracked:
         event(feed, "VEHICLE_DETECTED", f"{len(tracked)} vehicle(s) detected",
-              {"count": len(tracked)}, confidence=max_conf, object_type="Vehicle")
+              {"count": len(tracked)}, confidence=max_conf, object_type="Vehicle",
+              frame=frame, draw_items=draw_items)
 
     with detections_lock:
         latest_detections[feed] = dets
@@ -346,7 +368,8 @@ def humans(frame, model, tracker, feed):
 
     if tracked:
         event(feed, "HUMAN_DETECTED", f"{len(tracked)} person(s) detected",
-              {"count": len(tracked)}, confidence=max_conf, object_type="Person", cooldown=2.0)
+              {"count": len(tracked)}, confidence=max_conf, object_type="Person", cooldown=2.0,
+              frame=frame, draw_items=draw_items)
 
     with detections_lock:
         latest_detections[feed] = dets
@@ -358,11 +381,7 @@ def fence(frame, engine, feed):
     h, w = frame.shape[:2]
     dets = []
     draw_items = []
-    for alert in alerts:
-        event(feed, "INTRUSION_DETECTED",
-              f"Person crossed restricted zone (track #{alert['track_id']})",
-              details=alert, confidence=float(alert.get("confidence", 0.8)),
-              object_type="Person", cooldown=1.5)
+    fence_pts = np.array([(90, 125), (250, 125), (250, 235), (90, 235)], dtype=np.int32)
     
     for d in detections:
         x1, y1, x2, y2 = d["bbox"]
@@ -385,6 +404,13 @@ def fence(frame, engine, feed):
             "color": color_bgr,
             "is_alert": is_intruder
         })
+
+    for alert in alerts:
+        event(feed, "INTRUSION_DETECTED",
+              f"Person crossed restricted zone (track #{alert['track_id']})",
+              details=alert, confidence=float(alert.get("confidence", 0.8)),
+              object_type="Person", cooldown=1.5,
+              frame=frame, draw_items=draw_items, fence_pts=fence_pts)
     with detections_lock:
         latest_detections[feed] = dets
     return draw_items
@@ -454,10 +480,18 @@ def anpr(frame, vehicle_model, plate_engine, feed, frame_idx=0, plate_cache=None
                     plate = anpr_res.get("plate_number")
                     if plate:
                         plate_cache[vehicle_id] = anpr_res
+                        pb = anpr_res.get("plate_bbox") or vehicle_box
                         event(feed, "PLATE_DETECTED", f"Plate detected: {plate}",
                               anpr_res, plate_number=plate,
                               confidence=anpr_res.get("confidence"),
-                              object_type="Vehicle")
+                              object_type="Vehicle",
+                              frame=frame,
+                              draw_items=[{
+                                  "box": pb,
+                                  "label": f"PLATE: {plate}",
+                                  "color": (235, 180, 0),
+                                  "is_alert": False
+                              }])
                 except Exception:
                     pass
 
@@ -576,7 +610,8 @@ def suspicious(frame, model, tracker, feed):
 
     if tracked:
         event(feed, "SUSPICIOUS", f"Suspicious Activity: Unauthorized entry in restricted stairwell (Person #{tracked[0]['track_id']})",
-              {"track_id": tracked[0]['track_id']}, confidence=max_conf, object_type="Person", cooldown=2.0)
+              {"track_id": tracked[0]['track_id']}, confidence=max_conf, object_type="Person", cooldown=2.0,
+              frame=frame, draw_items=draw_items)
 
     with detections_lock:
         latest_detections[feed] = dets
@@ -607,7 +642,8 @@ def facial_rec(frame, detector, feed):
             det_type = "verified_face"
             is_alert = False
             event(feed, "HUMAN_DETECTED", "Facial Recognition Successful: Authorized Face Verified",
-                  {"status": "Verified"}, confidence=round(sim, 2), object_type="Person", cooldown=3.0)
+                  {"status": "Verified"}, confidence=round(sim, 2), object_type="Person", cooldown=3.0,
+                  frame=frame, draw_items=[{"box": (x, y, x + fw, y + fh), "label": f"{label} ({int(sim * 100)}%)", "color": color_bgr, "is_alert": False}])
         else:
             label = "Face Not Recognised"
             color_hex = "#ef4444"
@@ -615,7 +651,8 @@ def facial_rec(frame, detector, feed):
             det_type = "unrecognized_face"
             is_alert = True
             event(feed, "SUSPICIOUS", "Security Alert: Face Not Recognised",
-                  {"status": "Unrecognized"}, confidence=round(max(0.0, sim), 2), object_type="Person", cooldown=3.0)
+                  {"status": "Unrecognized"}, confidence=round(max(0.0, sim), 2), object_type="Person", cooldown=3.0,
+                  frame=frame, draw_items=[{"box": (x, y, x + fw, y + fh), "label": label, "color": color_bgr, "is_alert": True}])
 
         dets.append({
             "x1": round(x / w, 4),
@@ -970,6 +1007,49 @@ def download_events_csv():
 def get_events():
     with status_lock:
         return list(events)
+
+
+@app.websocket("/ws/status")
+async def websocket_status(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        while not stop_event.is_set():
+            with status_lock:
+                ev_list = list(events)
+            with detections_lock:
+                det_map = dict(latest_detections)
+            active_breaches = []
+            for feed_key, dets in det_map.items():
+                if feed_key == "virtual_fence" and any(d.get("type") == "intruder" for d in dets):
+                    active_breaches.append({
+                        "feed": feed_key,
+                        "cam": CAM_NAMES.get(feed_key, feed_key),
+                        "title": "Breach Detected",
+                    })
+                elif feed_key == "suspicious_activity" and any(d.get("type") == "suspicious" for d in dets):
+                    active_breaches.append({
+                        "feed": feed_key,
+                        "cam": CAM_NAMES.get(feed_key, feed_key),
+                        "title": "Breach Detected",
+                    })
+                elif feed_key == "facial_recognition" and any(d.get("type") == "unrecognized_face" for d in dets):
+                    active_breaches.append({
+                        "feed": feed_key,
+                        "cam": CAM_NAMES.get(feed_key, feed_key),
+                        "title": "Breach Detected",
+                    })
+            payload = {
+                "feeds": statuses,
+                "events": ev_list,
+                "total_events": EVENT_COUNTER,
+                "detections": det_map,
+                "fence": fence_metadata,
+                "active_breaches": active_breaches,
+            }
+            await websocket.send_json(payload)
+            await asyncio.sleep(0.9)
+    except (WebSocketDisconnect, Exception):
+        pass
 
 
 HTML = """
@@ -1497,25 +1577,33 @@ HTML = """
 
     .event-card-body {
       display: grid;
-      grid-template-columns: 96px 1fr;
+      grid-template-columns: 110px 1fr;
       gap: 0;
     }
     .event-snapshot {
-      width: 96px;
-      min-height: 54px;
-      background: #0f172a;
+      width: 110px;
+      min-height: 64px;
+      background: #0b1329;
       display: flex;
       align-items: center;
       justify-content: center;
       flex-shrink: 0;
+      cursor: pointer;
+      overflow: hidden;
+      border-right: 1px solid var(--border);
     }
     .event-snapshot img {
       width: 100%;
-      height: auto;
+      height: 100%;
+      object-fit: cover;
       display: block;
+      transition: transform 0.2s ease;
+    }
+    .event-snapshot:hover img {
+      transform: scale(1.06);
     }
     .event-snapshot-placeholder {
-      color: #475569;
+      color: #64748b;
       font-size: 10px;
       text-align: center;
       padding: 4px;
@@ -1671,7 +1759,7 @@ HTML = """
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
           Export Log
         </button>
-        <button class="btn" id="openEventsBtn">
+        <button class="btn" id="openEventsBtn" onclick="openEvents()">
           Events <span class="event-count-badge" id="eventsCountBadge">0</span>
         </button>
       </div>
@@ -1812,9 +1900,25 @@ HTML = """
     // ── Tactical Red Alert Banner ──
     let currentAlertFeed = 'virtual_fence';
 
-    function inspectAlertFeed() {
-      if (currentAlertFeed) {
+    function inspectAlertFeed(feedKey) {
+      const fk = feedKey || currentAlertFeed;
+      if (fk) {
         const camMap = {
+          'Cam 1': 'virtual_fence',
+          'Cam 2': 'vehicle_detection',
+          'Cam 3': 'human_detection',
+          'Cam 4': 'anpr',
+          'Cam 5': 'suspicious_activity',
+          'Cam 6': 'facial_recognition',
+          'virtual_fence': 'virtual_fence',
+          'vehicle_detection': 'vehicle_detection',
+          'human_detection': 'human_detection',
+          'anpr': 'anpr',
+          'suspicious_activity': 'suspicious_activity',
+          'facial_recognition': 'facial_recognition'
+        };
+        const resolvedKey = camMap[fk] || fk;
+        const titleMap = {
           'virtual_fence': 'Cam 1',
           'vehicle_detection': 'Cam 2',
           'human_detection': 'Cam 3',
@@ -1822,10 +1926,10 @@ HTML = """
           'suspicious_activity': 'Cam 5',
           'facial_recognition': 'Cam 6'
         };
-        const camLabel = camMap[currentAlertFeed] || currentAlertFeed;
-        openEnlarged(currentAlertFeed, camLabel);
+        openEnlarged(resolvedKey, titleMap[resolvedKey] || resolvedKey);
       }
     }
+    window.inspectAlertFeed = inspectAlertFeed;
 
     // ── Export Incident Log (CSV) ──
     function exportIncidentLog() {
@@ -1860,15 +1964,28 @@ HTML = """
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
     }
+    window.exportIncidentLog = exportIncidentLog;
 
-    document.getElementById('openEventsBtn').addEventListener('click', () => {
-      eventsDrawer.classList.add('active');
-      drawerOverlay.classList.add('active');
-    });
+    function openEvents() {
+      const drawer = document.getElementById('eventsDrawer');
+      const overlay = document.getElementById('drawerOverlay');
+      if (drawer) drawer.classList.add('active');
+      if (overlay) overlay.classList.add('active');
+      fetchEventsDirect();
+    }
+    window.openEvents = openEvents;
 
     function closeEvents() {
-      eventsDrawer.classList.remove('active');
-      drawerOverlay.classList.remove('active');
+      const drawer = document.getElementById('eventsDrawer');
+      const overlay = document.getElementById('drawerOverlay');
+      if (drawer) drawer.classList.remove('active');
+      if (overlay) overlay.classList.remove('active');
+    }
+    window.closeEvents = closeEvents;
+
+    const openBtn = document.getElementById('openEventsBtn');
+    if (openBtn) {
+      openBtn.onclick = openEvents;
     }
 
     let lastReceivedDetections = {};
@@ -1945,143 +2062,201 @@ HTML = """
     }
 
     let lastRenderedEventKey = '';
-    async function refreshStatus() {
-      try {
-        const response = await fetch('/api/status');
-        const data = await response.json();
-        
-        const events = data.events || [];
-        allEventsData = events;
 
-        // Tactical Red Alert Banner & Camera Card Glow (ONLY when active breach is happening right now!)
-        const activeBreaches = data.active_breaches || [];
-        const isBreached = activeBreaches.length > 0;
-        const banner = document.getElementById('alertBanner');
-        const bannerMsg = document.getElementById('alertBannerMsg');
+    function renderEventsList(events) {
+      if (!events) return;
+      allEventsData = events;
+      const currentEventKey = events.length > 0 ? (events[0].id != null ? events[0].id : events[0].timestamp + '_' + events.length) : 'empty';
+      if (currentEventKey === lastRenderedEventKey) return;
+      lastRenderedEventKey = currentEventKey;
 
-        // Apply / remove subtle red glow on each camera card
-        ['virtual_fence', 'vehicle_detection', 'human_detection', 'anpr', 'suspicious_activity', 'facial_recognition'].forEach(fk => {
-          const cardEl = document.getElementById('card-' + fk);
-          if (cardEl) {
-            const hasBreach = activeBreaches.some(b => b.feed === fk);
-            if (hasBreach) {
-              cardEl.classList.add('breach-glow');
-            } else {
-              cardEl.classList.remove('breach-glow');
-            }
-          }
-        });
+      if (events.length === 0) {
+        eventsList.innerHTML = '<p style="color: var(--text-muted); font-size: 13px; text-align: center; padding: 24px 10px;">No events recorded yet.</p>';
+        return;
+      }
 
-        // Banner only appears when there is an active breach happening right now
-        if (isBreached) {
-          const alertTexts = activeBreaches.map(b => `${b.cam} · ${b.title || 'Breach Detected'}`).join('  |  ');
-          if (bannerMsg) bannerMsg.textContent = alertTexts;
-          currentAlertFeed = activeBreaches[0].feed;
-          if (banner) banner.style.display = 'block';
-        } else {
-          if (banner) banner.style.display = 'none';
-        }
+      eventsList.innerHTML = '';
+      const PILL_CLASS = {
+        'Person Detected':   'pill-person',
+        'Vehicle Detected':  'pill-vehicle',
+        'ANPR Detected':     'pill-anpr',
+        'Fence Breach':      'pill-fence',
+        'Suspicious Activity': 'pill-suspicious',
+        'Camera/System Alert': 'pill-system',
+      };
+      const SEV_CLASS = { High: 'sev-high', Medium: 'sev-medium', Low: 'sev-low' };
 
-        // Update live events count badge in header
-        const badge = document.getElementById('eventsCountBadge');
-        if (badge) {
-          const total = data.total_events != null ? data.total_events : events.length;
-          badge.textContent = total;
-        }
+      events.forEach(e => {
+        const pillCls = PILL_CLASS[e.event_type] || 'pill-system';
+        const sevCls  = SEV_CLASS[e.severity] || 'sev-low';
+        const confPct = e.confidence != null ? Math.round(e.confidence * 100) : null;
+        const snapHtml = e.snapshot
+          ? `<img src="data:image/jpeg;base64,${e.snapshot}" alt="Evidence Snapshot" class="event-thumb-img">`
+          : `<div class="event-snapshot-placeholder">No<br>Preview</div>`;
 
-        // Only rebuild DOM if the event list actually changed
-        const currentEventKey = events.length > 0 ? (events[0].id != null ? events[0].id : events[0].timestamp + '_' + events.length) : 'empty';
-        if (currentEventKey !== lastRenderedEventKey) {
-          lastRenderedEventKey = currentEventKey;
-          if (events.length === 0) {
-            eventsList.innerHTML = '<p style="color: var(--text-muted); font-size: 13px;">No events recorded yet.</p>';
-          } else {
-            eventsList.innerHTML = '';
-            const PILL_CLASS = {
-              'Person Detected':   'pill-person',
-              'Vehicle Detected':  'pill-vehicle',
-              'ANPR Detected':     'pill-anpr',
-              'Fence Breach':      'pill-fence',
-              'Suspicious Activity': 'pill-suspicious',
-              'Camera/System Alert': 'pill-system',
-            };
-            const SEV_CLASS = { High: 'sev-high', Medium: 'sev-medium', Low: 'sev-low' };
-            events.forEach(e => {
-              const pillCls = PILL_CLASS[e.event_type] || 'pill-system';
-              const sevCls  = SEV_CLASS[e.severity] || 'sev-low';
-              const confPct = e.confidence != null ? Math.round(e.confidence * 100) : null;
-              const snapHtml = e.snapshot
-                ? `<img src="data:image/jpeg;base64,${e.snapshot}" alt="snap">`
-                : `<div class="event-snapshot-placeholder">No<br>Preview</div>`;
-
-              const card = document.createElement('div');
-              card.className = 'event-card';
-              card.innerHTML = `
-                <div class="event-card-header">
-                  <div class="severity-dot ${sevCls}"></div>
-                  <span class="event-type-pill ${pillCls}">${escapeHtml(e.event_type)}</span>
-                  <span class="event-header-time">${escapeHtml(e.feed)} · ${escapeHtml(e.time)}</span>
+        const card = document.createElement('div');
+        card.className = 'event-card';
+        card.innerHTML = `
+          <div class="event-card-header">
+            <div class="severity-dot ${sevCls}"></div>
+            <span class="event-type-pill ${pillCls}">${escapeHtml(e.event_type)}</span>
+            <span class="event-header-time">${escapeHtml(e.feed)} · ${escapeHtml(e.time)}</span>
+          </div>
+          <div class="event-card-body">
+            <div class="event-snapshot" title="Click to inspect ${escapeHtml(e.feed)}" onclick="inspectAlertFeed('${escapeHtml(e.feed)}')">${snapHtml}</div>
+            <div class="event-meta">
+              <div class="event-meta-grid">
+                <div class="meta-row">
+                  <span class="meta-label">Camera</span>
+                  <span class="meta-value">${escapeHtml(e.feed)}</span>
                 </div>
-                <div class="event-card-body">
-                  <div class="event-snapshot">${snapHtml}</div>
-                  <div class="event-meta">
-                    <div class="event-meta-grid">
-                      <div class="meta-row">
-                        <span class="meta-label">Camera</span>
-                        <span class="meta-value">${escapeHtml(e.feed)}</span>
-                      </div>
-                      <div class="meta-row">
-                        <span class="meta-label">Time</span>
-                        <span class="meta-value">${escapeHtml(e.time)}</span>
-                      </div>
-                      <div class="meta-row">
-                        <span class="meta-label">Object</span>
-                        <span class="meta-value">${escapeHtml(e.object || '—')}</span>
-                      </div>
-                      <div class="meta-row">
-                        <span class="meta-label">Severity</span>
-                        <span class="meta-value">${escapeHtml(e.severity)}</span>
-                      </div>
-                    </div>
-                    ${e.plate_number ? `
-                    <div class="meta-row" style="margin-top:4px;">
-                      <span class="meta-label">Plate Number</span>
-                      <span class="plate-value">${escapeHtml(e.plate_number)}</span>
-                    </div>` : ''}
-                    ${confPct != null ? `
-                    <div class="meta-row" style="margin-top:4px;">
-                      <span class="meta-label">Confidence</span>
-                      <div class="conf-bar-wrap">
-                        <div class="conf-bar"><div class="conf-bar-fill" style="width:${confPct}%"></div></div>
-                        <span class="meta-value">${confPct}%</span>
-                      </div>
-                    </div>` : ''}
-                    <div class="meta-row" style="margin-top:4px;">
-                      <span class="meta-label">Status</span>
-                      <span class="meta-value">${escapeHtml(e.status || 'Active')}</span>
-                    </div>
-                  </div>
-                </div>`;
-              eventsList.appendChild(card);
-            });
-          }
-        }
+                <div class="meta-row">
+                  <span class="meta-label">Time</span>
+                  <span class="meta-value">${escapeHtml(e.time)}</span>
+                </div>
+                <div class="meta-row">
+                  <span class="meta-label">Object</span>
+                  <span class="meta-value">${escapeHtml(e.object || '—')}</span>
+                </div>
+                <div class="meta-row">
+                  <span class="meta-label">Severity</span>
+                  <span class="meta-value">${escapeHtml(e.severity)}</span>
+                </div>
+              </div>
+              ${e.plate_number ? `
+              <div class="meta-row" style="margin-top:4px;">
+                <span class="meta-label">Plate Number</span>
+                <span class="plate-value">${escapeHtml(e.plate_number)}</span>
+              </div>` : ''}
+              ${confPct != null ? `
+              <div class="meta-row" style="margin-top:4px;">
+                <span class="meta-label">Confidence</span>
+                <div class="conf-bar-wrap">
+                  <div class="conf-bar"><div class="conf-bar-fill" style="width:${confPct}%"></div></div>
+                  <span class="meta-value">${confPct}%</span>
+                </div>
+              </div>` : ''}
+              <div class="meta-row" style="margin-top:4px;">
+                <span class="meta-label">Status</span>
+                <span class="meta-value">${escapeHtml(e.status || 'Active')}</span>
+              </div>
+            </div>
+          </div>`;
+        eventsList.appendChild(card);
+      });
+    }
 
-        const detections = data.detections || {};
-        lastReceivedDetections = detections;
-        for (const [feedKey, detList] of Object.entries(detections)) {
-          renderFeedDetections(feedKey, detList);
-          if (activeEnlargedKey === feedKey) {
-            renderFeedDetections('modal', detList);
+    function updateDashboardState(data) {
+      if (!data) return;
+      const events = data.events || [];
+      const badge = document.getElementById('eventsCountBadge');
+      if (badge) {
+        const total = data.total_events != null ? data.total_events : events.length;
+        badge.textContent = total;
+      }
+
+      renderEventsList(events);
+
+      // Tactical Red Alert Banner & Camera Card Glow
+      const activeBreaches = data.active_breaches || [];
+      const isBreached = activeBreaches.length > 0;
+      const banner = document.getElementById('alertBanner');
+      const bannerMsg = document.getElementById('alertBannerMsg');
+
+      ['virtual_fence', 'vehicle_detection', 'human_detection', 'anpr', 'suspicious_activity', 'facial_recognition'].forEach(fk => {
+        const cardEl = document.getElementById('card-' + fk);
+        if (cardEl) {
+          const hasBreach = activeBreaches.some(b => b.feed === fk);
+          if (hasBreach) {
+            cardEl.classList.add('breach-glow');
+          } else {
+            cardEl.classList.remove('breach-glow');
           }
         }
-      } catch (err) {
-        console.error('Failed to fetch status', err);
+      });
+
+      if (isBreached) {
+        const alertTexts = activeBreaches.map(b => `${b.cam} · ${b.title || 'Breach Detected'}`).join('  |  ');
+        if (bannerMsg) bannerMsg.textContent = alertTexts;
+        currentAlertFeed = activeBreaches[0].feed;
+        if (banner) banner.style.display = 'block';
+      } else {
+        if (banner) banner.style.display = 'none';
+      }
+
+      const detections = data.detections || {};
+      lastReceivedDetections = detections;
+      for (const [feedKey, detList] of Object.entries(detections)) {
+        renderFeedDetections(feedKey, detList);
+        if (activeEnlargedKey === feedKey) {
+          renderFeedDetections('modal', detList);
+        }
       }
     }
 
-    refreshStatus();
-    setInterval(refreshStatus, 1000);
+    async function fetchEventsDirect() {
+      try {
+        const res = await fetch('/api/events');
+        if (res.ok) {
+          const evList = await res.json();
+          if (evList && evList.length) {
+            renderEventsList(evList);
+            const badge = document.getElementById('eventsCountBadge');
+            if (badge) badge.textContent = evList.length;
+          }
+        }
+      } catch (e) {}
+    }
+
+    let wsConnected = false;
+    let statusWs = null;
+
+    function connectStatusWebSocket() {
+      const loc = window.location;
+      const wsProtocol = loc.protocol === 'https:' ? 'wss:' : 'ws:';
+      const wsUrl = `${wsProtocol}//${loc.host}/ws/status`;
+      try {
+        statusWs = new WebSocket(wsUrl);
+        statusWs.onopen = () => {
+          wsConnected = true;
+          console.log('[Drishti] Live status WebSocket connected.');
+        };
+        statusWs.onmessage = (evt) => {
+          try {
+            const data = JSON.parse(evt.data);
+            updateDashboardState(data);
+          } catch (e) {
+            console.error('Error parsing status WS message', e);
+          }
+        };
+        statusWs.onclose = () => {
+          wsConnected = false;
+          setTimeout(connectStatusWebSocket, 2000);
+        };
+        statusWs.onerror = () => {
+          wsConnected = false;
+          try { statusWs.close(); } catch(e){}
+        };
+      } catch (e) {
+        wsConnected = false;
+        setTimeout(connectStatusWebSocket, 3000);
+      }
+    }
+    connectStatusWebSocket();
+
+    // Fallback polling in case WebSocket is blocked or pending
+    async function fallbackPoll() {
+      if (!wsConnected) {
+        try {
+          const res = await fetch('/api/status');
+          if (res.ok) {
+            const data = await res.json();
+            updateDashboardState(data);
+          }
+        } catch (e) {}
+      }
+    }
+    setInterval(fallbackPoll, 2000);
   </script>
 </body>
 </html>
