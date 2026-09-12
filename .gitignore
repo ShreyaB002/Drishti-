@@ -81,6 +81,7 @@ temp/
 tmp/
 scratch/
 event_log_*.csv
+events.csv
 
 # ── PaddleOCR / EasyOCR / Ultralytics cache ────────────────────────────────────
 inference/

@@ -1,4 +1,5 @@
 import base64
+import csv
 import sys
 import threading
 import time
@@ -20,6 +21,18 @@ print(f"[Drishti Engine] Active Compute Device: {DEVICE} (FP16 Half-Precision: {
 ROOT = Path(__file__).resolve().parent
 TEST_DIR = ROOT / "test"
 ASSETS_DIR = ROOT / "assets"
+EVENTS_CSV = ROOT / "events.csv"
+csv_lock = threading.Lock()
+EVENT_COUNTER = 0
+
+# Initialize events.csv with standard headers if it doesn't exist
+if not EVENTS_CSV.exists():
+    try:
+        with open(EVENTS_CSV, "w", newline="", encoding="utf-8") as _f:
+            _w = csv.writer(_f)
+            _w.writerow(["Event_ID", "Timestamp", "Time", "Camera", "Event_Type", "Severity", "Object", "Confidence", "Plate_Number", "Status", "Message"])
+    except Exception as _exc:
+        print(f"[Warning] Failed to initialize {EVENTS_CSV}: {_exc}")
 
 FAVICON_DATA_URI = ""
 _fav_file = ASSETS_DIR / "favion.png"
@@ -125,7 +138,13 @@ def event(feed, event_type, message, details=None, cooldown=1.5,
     display = EVENT_DISPLAY.get(event_type, event_type)
     snapshot = get_snapshot(feed)
 
+    global EVENT_COUNTER
+    with status_lock:
+        EVENT_COUNTER += 1
+        item_id = EVENT_COUNTER
+
     item = {
+        "id": item_id,
         "time": time.strftime("%H:%M:%S"),
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         "feed": cam_label,
@@ -142,6 +161,32 @@ def event(feed, event_type, message, details=None, cooldown=1.5,
     }
     with status_lock:
         events.appendleft(item)
+
+    # 1. Real-Time Console Log in Terminal
+    conf_str = f" ({int(confidence * 100)}%)" if confidence is not None else ""
+    plate_str = f" [Plate: {plate_number}]" if plate_number else ""
+    print(f"[EVENT #{item_id:04d}] [{item['timestamp']}] [{severity.upper():<6}] [{cam_label}] {display}: {message}{plate_str}{conf_str}", flush=True)
+
+    # 2. Persistent Audit Log to events.csv
+    try:
+        with csv_lock:
+            with open(EVENTS_CSV, "a", newline="", encoding="utf-8") as _f:
+                writer = csv.writer(_f)
+                writer.writerow([
+                    item_id,
+                    item["timestamp"],
+                    item["time"],
+                    cam_label,
+                    display,
+                    severity,
+                    obj or "",
+                    f"{round(confidence * 100)}%" if confidence is not None else "",
+                    plate_number or "",
+                    "Active",
+                    message
+                ])
+    except Exception:
+        pass
 
 
 def draw_surveillance_box(img, x1, y1, x2, y2, label, color_bgr, thickness=2, is_alert=False):
@@ -906,10 +951,19 @@ def status():
     return {
         "feeds": statuses,
         "events": ev_list,
+        "total_events": EVENT_COUNTER,
         "detections": det_map,
         "fence": fence_metadata,
         "active_breaches": active_breaches,
     }
+
+
+@app.get("/events.csv")
+@app.get("/api/events/csv")
+def download_events_csv():
+    if EVENTS_CSV.exists():
+        return FileResponse(EVENTS_CSV, media_type="text/csv", filename="drishti_events.csv")
+    return HTMLResponse("No events logged yet.", status_code=404)
 
 
 @app.get("/api/events")
@@ -1617,7 +1671,9 @@ HTML = """
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
           Export Log
         </button>
-        <button class="btn" id="openEventsBtn">Events</button>
+        <button class="btn" id="openEventsBtn">
+          Events <span class="event-count-badge" id="eventsCountBadge">0</span>
+        </button>
       </div>
     </header>
 
@@ -1926,8 +1982,15 @@ HTML = """
           if (banner) banner.style.display = 'none';
         }
 
+        // Update live events count badge in header
+        const badge = document.getElementById('eventsCountBadge');
+        if (badge) {
+          const total = data.total_events != null ? data.total_events : events.length;
+          badge.textContent = total;
+        }
+
         // Only rebuild DOM if the event list actually changed
-        const currentEventKey = events.length > 0 ? (events[0].timestamp + '_' + events.length) : 'empty';
+        const currentEventKey = events.length > 0 ? (events[0].id != null ? events[0].id : events[0].timestamp + '_' + events.length) : 'empty';
         if (currentEventKey !== lastRenderedEventKey) {
           lastRenderedEventKey = currentEventKey;
           if (events.length === 0) {
