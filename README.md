@@ -44,10 +44,24 @@ venv\Scripts\activate
 source venv/bin/activate
 
 # 3. Install dependencies
-pip install fastapi uvicorn opencv-python ultralytics numpy easyocr pydantic
+pip install fastapi uvicorn opencv-python ultralytics numpy easyocr pydantic websockets
 
-# 4. Run tactical dashboard
-python fastapi_dashboard.py
+# 4. Download AI Model Weights & Sample Video Feeds
+python download_assets.py
+
+# 5. Run tactical command dashboard
+python -m uvicorn fastapi_dashboard:app --host 0.0.0.0 --port 8000
 ```
 
 Access the command center at: **`http://localhost:8000`**
+
+---
+
+## 📦 Model Weights & Sample Feeds
+
+Pre-trained AI weights (`plate_detector.pt`, `yolo11n.pt`) and multi-camera surveillance video feeds are published on GitHub Releases:
+
+🔗 **[GitHub Release v1.0.0](https://github.com/ShreyaB002/Drishti-/releases/tag/v1.0.0)**
+
+* **Automated Setup:** Run `python download_assets.py` to automatically download and unpack all weights and video feeds into the workspace.
+* **Manual Setup:** Download [`drishti_assets_v1.0.0.zip`](https://github.com/ShreyaB002/Drishti-/releases/download/v1.0.0/drishti_assets_v1.0.0.zip) directly and extract into the project root directory.
