@@ -47,7 +47,7 @@ if _fav_file.exists():
 ANPR_ROOT = ROOT / "anpr_engine"
 sys.path.insert(0, str(ANPR_ROOT))
 
-from virtual_fence_engine import VirtualFenceEngine, SurveillanceTracker
+from virtual_fence.virtual_fence_engine import VirtualFenceEngine, SurveillanceTracker
 
 try:
     from anpr import ANPREngine

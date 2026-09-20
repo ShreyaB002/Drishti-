@@ -271,11 +271,14 @@ Drishti/
 │   └── vehicle_detection.mp4
 ├── templates/                       # Jinja2 / HTML UI templates
 │   └── index.html
-├── virtual_fence_engine.py          # Standalone Virtual Fence Engine & MOT Tracker
+├── virtual_fence/                   # Standalone Virtual Fence Engine & MOT Tracker
+│   └── virtual_fence_engine.py
+├── human_detection/                 # Standalone Pose Estimation & Motion Tracker
+│   └── human_detection.py
+├── vehicle_detection/               # Standalone Vehicle Classifier
+│   └── vehicle_detection.py
 ├── fastapi_dashboard.py             # Production 6-Camera Tactical Server & Web UI
 ├── fastapi_app.py                   # Lightweight Single-Feed Virtual Fence Service
-├── human_detection.py               # Standalone Pose Estimation & Motion Tracker
-├── vehicle_detection.py             # Standalone Vehicle Classifier
 ├── .gitignore                       # Repository exclusion rules
 ├── README.md                        # Project landing document
 └── DOCUMENTATION.md                 # Complete System Architecture & Manual

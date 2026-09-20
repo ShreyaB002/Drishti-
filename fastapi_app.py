@@ -8,7 +8,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from virtual_fence_engine import VirtualFenceEngine
+from virtual_fence.virtual_fence_engine import VirtualFenceEngine
 
 ROOT = Path(__file__).resolve().parent
 ASSETS_DIR = ROOT / "assets"
